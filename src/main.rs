@@ -4,12 +4,13 @@ use std::str;
 use serde_json::Value;
 
 // 探す対象に NovelAI 用のキー (Description, Comment) を追加
-const TARGET_KEYWORDS: [&str; 5] = [
-    "parameters", // SD (A1111)
-    "prompt",     // ComfyUI
-    "workflow",   // ComfyUI
-    "Description",// NovelAI (Prompt)
-    "Comment"     // NovelAI (Settings JSON)
+const TARGET_KEYWORDS: [&str; 6] = [
+    "parameters",      // SD (A1111)
+    "prompt",          // ComfyUI
+    "workflow",        // ComfyUI
+    "generation_data", // ComfyUI (rare case)
+    "Description",     // NovelAI (Prompt)
+    "Comment"          // NovelAI (Settings JSON)
 ];
 
 fn extract_png_metadata(mmap: &[u8], path: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -89,6 +90,14 @@ fn print_metadata(keyword: &str, text: &str) -> Result<(), Box<dyn std::error::E
             println!("--- Stable Diffusion (A1111) ---");
             println!("{}", text);
         },
+        "generation_data" => {
+            println!("--- ComfyUI [Generation Data] ---");
+            if let Ok(v) = serde_json::from_str::<Value>(text) {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                println!("{}", text);
+            }
+        },
         _ => {
             println!("--- {} ---", keyword);
             println!("{}", text);
@@ -98,19 +107,44 @@ fn print_metadata(keyword: &str, text: &str) -> Result<(), Box<dyn std::error::E
 }
 
 fn extract_from_exif(exif_data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    // "UNICODE\0" を探す（UserCommentの文字コード指定）
-    if let Some(pos) = exif_data.windows(8).position(|w| w == b"UNICODE\0") {
-        let data_start = pos + 8;
-        if data_start < exif_data.len() {
-            let remaining = &exif_data[data_start..];
-            
-            // UTF-16BEとして読み取り
-            if remaining.len() >= 2 {
-                let utf16_data: Vec<u16> = remaining
+    // UserCommentは最初の8バイトが文字コード識別子（ただし先頭に余分なバイトがある場合がある）
+    let (charset, text_data) = if exif_data.len() >= 12 && &exif_data[0..4] == b"\0\0\0\0" {
+        // 先頭4バイトが\0\0\0\0の場合、オフセット4から8バイトが文字コード識別子
+        (&exif_data[4..12], &exif_data[12..])
+    } else if exif_data.len() >= 8 {
+        // 標準的な位置
+        (&exif_data[0..8], &exif_data[8..])
+    } else {
+        return Ok(());
+    };
+        
+        // 文字コードに応じてデコード
+        if charset == b"UNICODE\0" {
+            // UTF-16としてデコード（BOMまたは最初の文字でエンディアン判定）
+            if text_data.len() >= 2 {
+                let is_le = if text_data.len() >= 2 {
+                    let first = u16::from_le_bytes([text_data[0], text_data[1]]);
+                    let first_be = u16::from_be_bytes([text_data[0], text_data[1]]);
+                    // BOMチェック
+                    if first == 0xFEFF { true }
+                    else if first_be == 0xFEFF { false }
+                    // ASCII範囲の文字かチェック
+                    else { first >= 0x0020 && first <= 0x007E }
+                } else {
+                    false
+                };
+                
+                let utf16_data: Vec<u16> = text_data
                     .chunks_exact(2)
                     .take(5000)
-                    .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
-                    .take_while(|&c| c != 0)
+                    .map(|chunk| {
+                        if is_le {
+                            u16::from_le_bytes([chunk[0], chunk[1]])
+                        } else {
+                            u16::from_be_bytes([chunk[0], chunk[1]])
+                        }
+                    })
+                    .take_while(|&c| c != 0 && c != 0xFEFF)
                     .collect();
                 
                 if let Ok(text) = String::from_utf16(&utf16_data) {
@@ -118,8 +152,30 @@ fn extract_from_exif(exif_data: &[u8]) -> Result<(), Box<dyn std::error::Error>>
                     println!("{}", text);
                 }
             }
+        } else if charset == b"ASCII\0\0\0" {
+            // ASCII/UTF-8としてデコード
+            if let Ok(text) = str::from_utf8(text_data) {
+                let trimmed = text.trim_end_matches('\0');
+                println!("--- EXIF UserComment ---");
+                println!("{}", trimmed);
+            }
+        } else if charset == b"JIS\0\0\0\0\0" {
+            // JIS (ISO-2022-JP)
+            if let Ok(text) = str::from_utf8(text_data) {
+                let trimmed = text.trim_end_matches('\0');
+                println!("--- EXIF UserComment ---");
+                println!("{}", trimmed);
+            }
+        } else if charset == b"\0\0\0\0\0\0\0\0" {
+            // 未定義の場合、ASCII/UTF-8として試す
+            if let Ok(text) = str::from_utf8(text_data) {
+                let trimmed = text.trim_end_matches('\0');
+                if !trimmed.is_empty() {
+                    println!("--- EXIF UserComment ---");
+                    println!("{}", trimmed);
+                }
+            }
         }
-    }
     
     Ok(())
 }
@@ -127,37 +183,105 @@ fn extract_from_exif(exif_data: &[u8]) -> Result<(), Box<dyn std::error::Error>>
 fn extract_exif_metadata(mmap: &[u8], path: &str, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== {} File: {} ===", format, path);
     
-    // UserCommentタグ (0x9286) を直接探す
-    // EXIFデータは通常ファイルの先頭付近にあるので、最初の64KBのみ検索
+    // TIFFヘッダーを探す（Exifマーカーの後）
     let search_len = mmap.len().min(65536);
+    let mut tiff_start = 0;
     
+    // "Exif\0\0" を探してTIFFヘッダーの位置を特定
+    for i in 0..search_len.saturating_sub(10) {
+        if &mmap[i..i+6] == b"Exif\0\0" {
+            tiff_start = i + 6;
+            break;
+        }
+    }
+    
+    if tiff_start == 0 {
+        return Ok(());
+    }
+    
+    // UserCommentタグ (0x9286) を探す
     for i in 0..search_len.saturating_sub(12) {
-        // ビッグエンディアンでタグを探す: 92 86
         if mmap[i] == 0x92 && mmap[i+1] == 0x86 {
-            // データ長を取得（オフセット+4から4バイト、ビッグエンディアン）
+            // データ長を取得
             let data_len = u32::from_be_bytes([mmap[i+4], mmap[i+5], mmap[i+6], mmap[i+7]]) as usize;
             
-            // データオフセットを取得（通常はタグの後12バイト）
-            let data_offset = i + 12;
+            // データオフセットを取得（TIFFヘッダーからの相対オフセット）
+            let offset_value = u32::from_be_bytes([mmap[i+8], mmap[i+9], mmap[i+10], mmap[i+11]]) as usize;
             
-            if data_offset + data_len <= mmap.len() {
+            // 絶対オフセットを計算
+            let data_offset = tiff_start + offset_value;
+            
+            // eprintln!("UserComment tag at {}, data_len={}, offset_value={}, tiff_start={}, data_offset={}", i, data_len, offset_value, tiff_start, data_offset);
+            
+            if data_offset + data_len <= mmap.len() && data_len >= 8 {
                 let user_comment_data = &mmap[data_offset..data_offset + data_len];
                 
-                // "UNICODE\0" を探す
-                if let Some(unicode_pos) = user_comment_data.windows(8).position(|w| w == b"UNICODE\0") {
-                    let text_start = unicode_pos + 8;
-                    let text_data = &user_comment_data[text_start..];
-                    
-                    // UTF-16BEとしてデコード
-                    let utf16_data: Vec<u16> = text_data
-                        .chunks_exact(2)
-                        .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
-                        .take_while(|&c| c != 0)
-                        .collect();
-                    
-                    if let Ok(text) = String::from_utf16(&utf16_data) {
+                // eprintln!("First 20 bytes: {:02X?}", &user_comment_data[..20.min(user_comment_data.len())]);
+                
+                let (charset, text_data) = if user_comment_data.len() >= 12 && &user_comment_data[0..4] == b"\0\0\0\0" {
+                    (&user_comment_data[4..12], &user_comment_data[12..])
+                } else if user_comment_data.len() >= 8 {
+                    (&user_comment_data[0..8], &user_comment_data[8..])
+                } else {
+                    break;
+                };
+                
+                // 文字コードに応じてデコード
+                if charset == b"UNICODE\0" {
+                    // UTF-16としてデコード（BOMまたは最初の文字でエンディアン判定）
+                    if text_data.len() >= 2 {
+                        let is_le = if text_data.len() >= 2 {
+                            // 最初の2バイトをチェック（BOMまたは最初の文字）
+                            let first = u16::from_le_bytes([text_data[0], text_data[1]]);
+                            let first_be = u16::from_be_bytes([text_data[0], text_data[1]]);
+                            // BOMチェック
+                            if first == 0xFEFF { true }
+                            else if first_be == 0xFEFF { false }
+                            // ASCII範囲の文字かチェック（LE: 0x0020-0x007E, BE: 0x2000-0x7E00）
+                            else { first >= 0x0020 && first <= 0x007E }
+                        } else {
+                            false
+                        };
+                        
+                        let utf16_data: Vec<u16> = text_data
+                            .chunks_exact(2)
+                            .map(|chunk| {
+                                if is_le {
+                                    u16::from_le_bytes([chunk[0], chunk[1]])
+                                } else {
+                                    u16::from_be_bytes([chunk[0], chunk[1]])
+                                }
+                            })
+                            .take_while(|&c| c != 0 && c != 0xFEFF)
+                            .collect();
+                        
+                        if let Ok(text) = String::from_utf16(&utf16_data) {
+                            println!("--- EXIF UserComment ---");
+                            println!("{}", text);
+                        }
+                    }
+                } else if charset == b"ASCII\0\0\0" {
+                    // ASCII/UTF-8としてデコード
+                    if let Ok(text) = str::from_utf8(text_data) {
+                        let trimmed = text.trim_end_matches('\0');
                         println!("--- EXIF UserComment ---");
-                        println!("{}", text);
+                        println!("{}", trimmed);
+                    }
+                } else if charset == b"JIS\0\0\0\0\0" {
+                    // JIS (ISO-2022-JP) - 基本的にはASCII互換として扱う
+                    if let Ok(text) = str::from_utf8(text_data) {
+                        let trimmed = text.trim_end_matches('\0');
+                        println!("--- EXIF UserComment ---");
+                        println!("{}", trimmed);
+                    }
+                } else if charset == b"\0\0\0\0\0\0\0\0" {
+                    // 未定義の場合、ASCII/UTF-8として試す
+                    if let Ok(text) = str::from_utf8(text_data) {
+                        let trimmed = text.trim_end_matches('\0');
+                        if !trimmed.is_empty() {
+                            println!("--- EXIF UserComment ---");
+                            println!("{}", trimmed);
+                        }
                     }
                 }
             }
