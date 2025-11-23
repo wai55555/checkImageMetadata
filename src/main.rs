@@ -39,6 +39,40 @@ fn extract_png_metadata(mmap: &[u8], path: &str) -> Result<(), Box<dyn std::erro
                 }
             }
         }
+        // 国際化テキストチャンク (iTXt) の処理
+        else if chunk_type == b"iTXt" {
+            let data = &mmap[data_start..data_start + chunk_len];
+            // Structure: Keyword + null + comp_flag + comp_method + lang_tag + null + trans_key + null + text
+            if let Some(null_pos) = data.iter().position(|&b| b == 0) {
+                if let Ok(keyword) = str::from_utf8(&data[0..null_pos]) {
+                    if TARGET_KEYWORDS.contains(&keyword) {
+                        // Check compression flag (offset: null_pos + 1)
+                        if null_pos + 2 < data.len() {
+                            let comp_flag = data[null_pos + 1];
+                            // let comp_method = data[null_pos + 2];
+                            
+                            if comp_flag == 0 {
+                                // Uncompressed
+                                let rest = &data[null_pos + 3..];
+                                // Skip lang_tag (null terminated)
+                                if let Some(lang_end) = rest.iter().position(|&b| b == 0) {
+                                    let rest2 = &rest[lang_end + 1..];
+                                    // Skip trans_key (null terminated)
+                                    if let Some(trans_end) = rest2.iter().position(|&b| b == 0) {
+                                        let text_bytes = &rest2[trans_end + 1..];
+                                        if let Ok(text) = str::from_utf8(text_bytes) {
+                                            print_metadata(keyword, text)?;
+                                        }
+                                    }
+                                }
+                            } else {
+                                println!("--- {} (Compressed iTXt not supported yet) ---", keyword);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         cursor = next_chunk;
     }
@@ -198,39 +232,52 @@ fn extract_exif_metadata(mmap: &[u8], path: &str, format: &str) -> Result<(), Bo
     if tiff_start == 0 {
         return Ok(());
     }
+
+    // Check Byte Order
+    if tiff_start + 2 > mmap.len() { return Ok(()); }
+    let is_le = match &mmap[tiff_start..tiff_start+2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return Ok(()), // Invalid TIFF header
+    };
+
+    // Helper to read u32
+    let read_u32 = |offset: usize| -> Option<u32> {
+        if offset + 4 > mmap.len() { return None; }
+        let bytes = [mmap[offset], mmap[offset+1], mmap[offset+2], mmap[offset+3]];
+        Some(if is_le { u32::from_le_bytes(bytes) } else { u32::from_be_bytes(bytes) })
+    };
     
     // UserCommentタグ (0x9286) を探す
-    for i in 0..search_len.saturating_sub(12) {
-        if mmap[i] == 0x92 && mmap[i+1] == 0x86 {
+    let tag_id = if is_le { [0x86, 0x92] } else { [0x92, 0x86] };
+
+    for i in tiff_start..search_len.saturating_sub(12) {
+        if mmap[i] == tag_id[0] && mmap[i+1] == tag_id[1] {
             // データ長を取得
-            let data_len = u32::from_be_bytes([mmap[i+4], mmap[i+5], mmap[i+6], mmap[i+7]]) as usize;
+            let data_len = read_u32(i + 4).unwrap_or(0) as usize;
             
             // データオフセットを取得（TIFFヘッダーからの相対オフセット）
-            let offset_value = u32::from_be_bytes([mmap[i+8], mmap[i+9], mmap[i+10], mmap[i+11]]) as usize;
+            let offset_value = read_u32(i + 8).unwrap_or(0) as usize;
             
             // 絶対オフセットを計算
             let data_offset = tiff_start + offset_value;
             
-            // eprintln!("UserComment tag at {}, data_len={}, offset_value={}, tiff_start={}, data_offset={}", i, data_len, offset_value, tiff_start, data_offset);
-            
             if data_offset + data_len <= mmap.len() && data_len >= 8 {
                 let user_comment_data = &mmap[data_offset..data_offset + data_len];
-                
-                // eprintln!("First 20 bytes: {:02X?}", &user_comment_data[..20.min(user_comment_data.len())]);
                 
                 let (charset, text_data) = if user_comment_data.len() >= 12 && &user_comment_data[0..4] == b"\0\0\0\0" {
                     (&user_comment_data[4..12], &user_comment_data[12..])
                 } else if user_comment_data.len() >= 8 {
                     (&user_comment_data[0..8], &user_comment_data[8..])
                 } else {
-                    break;
+                    continue;
                 };
                 
                 // 文字コードに応じてデコード
                 if charset == b"UNICODE\0" {
                     // UTF-16としてデコード（BOMまたは最初の文字でエンディアン判定）
                     if text_data.len() >= 2 {
-                        let is_le = if text_data.len() >= 2 {
+                        let is_le_text = if text_data.len() >= 2 {
                             // 最初の2バイトをチェック（BOMまたは最初の文字）
                             let first = u16::from_le_bytes([text_data[0], text_data[1]]);
                             let first_be = u16::from_be_bytes([text_data[0], text_data[1]]);
@@ -246,7 +293,7 @@ fn extract_exif_metadata(mmap: &[u8], path: &str, format: &str) -> Result<(), Bo
                         let utf16_data: Vec<u16> = text_data
                             .chunks_exact(2)
                             .map(|chunk| {
-                                if is_le {
+                                if is_le_text {
                                     u16::from_le_bytes([chunk[0], chunk[1]])
                                 } else {
                                     u16::from_be_bytes([chunk[0], chunk[1]])
