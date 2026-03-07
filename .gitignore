@@ -4,6 +4,7 @@ venv/
 .venv/
 .vscode
 .idea/
+scripts/
 .kiro
 *.env
 dist/
