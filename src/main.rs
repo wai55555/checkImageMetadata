@@ -1,10 +1,9 @@
 use memmap2::MmapOptions;
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, Read};
 use std::str;
 use serde_json::Value;
-use flate2::read::ZlibDecoder;
-use image::GenericImageView;
+use flate2::read::{GzDecoder, ZlibDecoder};
 
 // 探す対象のキーワードリスト
 const TARGET_KEYWORDS: [&str; 6] = [
@@ -91,14 +90,12 @@ fn extract_png_metadata(mmap: &[u8], path: &str) -> Result<(), Box<dyn std::erro
         }
     }
 
-    // それでも見つからない場合は Stealth PNG を試す
+    // 通常のPNGメタデータに加えて Stealth PNG も走査する
     if !found_metadata {
-        if let Ok(stealth_meta) = check_stealth_png(path) {
-            if !stealth_meta.is_empty() {
-                println!("--- Stealth PNG Info ---");
-                println!("{}", stealth_meta);
-                found_metadata = true;
-            }
+        if let Some((mode, signature, stealth_meta)) = check_stealth_png(mmap) {
+            println!("--- Stealth PNG Info ({}) [{}] ---", mode, signature);
+            println!("{}", stealth_meta);
+            found_metadata = true;
         }
     }
 
@@ -159,40 +156,268 @@ fn parse_png_chunk(chunk_type: &[u8], data: &[u8]) -> Result<bool, Box<dyn std::
     Ok(meta_found)
 }
 
-fn check_stealth_png(path: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let img = image::open(path)?;
-    let (width, height) = img.dimensions();
-    
-    // Stealth PNG Info はピクセルの αチャンネル または RGB の LSB に埋め込まれている
-    // パフォーマンスのため、最初の 1000 ピクセル程度でシグネチャを確認
-    let mut bits = String::new();
-    let has_alpha = img.color().has_alpha();
-    
-    let mut count = 0;
-    'outer: for y in 0..height {
-        for x in 0..width {
-            let pixel = img.get_pixel(x, y);
-            if has_alpha {
-                // αチャンネルの LSB を取得
-                bits.push(if (pixel[3] & 1) == 1 { '1' } else { '0' });
-            } else {
-                // RGB の各 LSB を取得 (R, G, B の順)
-                bits.push(if (pixel[0] & 1) == 1 { '1' } else { '0' });
-                bits.push(if (pixel[1] & 1) == 1 { '1' } else { '0' });
-                bits.push(if (pixel[2] & 1) == 1 { '1' } else { '0' });
+const MAX_STEALTH_DIMENSION: usize = 16_384;
+const MAX_STEALTH_DECODED_PNG_BYTES: usize = 512 * 1024 * 1024;
+const MAX_STEALTH_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+const MAX_STEALTH_IDAT_BYTES: usize = 512 * 1024 * 1024;
+const STEALTH_HEADER_BITS: usize = ("stealth_pnginfo".len() * 8) + 32;
+const STEALTH_SIGNATURE_BYTES: usize = "stealth_pnginfo".len();
+
+struct PngIdatReader<'a> {
+    chunks: Vec<&'a [u8]>,
+    chunk_index: usize,
+    chunk_offset: usize,
+}
+
+impl<'a> PngIdatReader<'a> {
+    fn new(chunks: Vec<&'a [u8]>) -> Self {
+        Self { chunks, chunk_index: 0, chunk_offset: 0 }
+    }
+}
+
+impl<'a> Read for PngIdatReader<'a> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let mut written = 0;
+        while written < buffer.len() && self.chunk_index < self.chunks.len() {
+            let chunk = self.chunks[self.chunk_index];
+            if self.chunk_offset == chunk.len() {
+                self.chunk_index += 1;
+                self.chunk_offset = 0;
+                continue;
             }
-            count += 1;
-            if count > 10000 { break 'outer; } // 最大 1万ビット (約1.2KB) 程度でシグネチャを探す
+            let amount = (buffer.len() - written).min(chunk.len() - self.chunk_offset);
+            buffer[written..written + amount]
+                .copy_from_slice(&chunk[self.chunk_offset..self.chunk_offset + amount]);
+            written += amount;
+            self.chunk_offset += amount;
+        }
+        Ok(written)
+    }
+}
+
+fn check_stealth_png(png: &[u8]) -> Option<(String, String, String)> {
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if png.get(..8)? != PNG_SIGNATURE || png.get(12..16)? != b"IHDR" {
+        return None;
+    }
+    let ihdr_len = u32::from_be_bytes(png.get(8..12)?.try_into().ok()?) as usize;
+    if ihdr_len != 13 {
+        return None;
+    }
+    let ihdr = png.get(16..29)?;
+    let width = u32::from_be_bytes(ihdr[0..4].try_into().ok()?) as usize;
+    let height = u32::from_be_bytes(ihdr[4..8].try_into().ok()?) as usize;
+    let bit_depth = ihdr[8];
+    let color_type = ihdr[9];
+    // 拡張機能のステルススキャナーが対応する非インターレース配置に限定する。
+    if width == 0 || height == 0 || width > MAX_STEALTH_DIMENSION ||
+        height > MAX_STEALTH_DIMENSION || ihdr[10] != 0 || ihdr[11] != 0 || ihdr[12] != 0 ||
+        !matches!((color_type, bit_depth), (2 | 4 | 6, 8 | 16)) {
+        return None;
+    }
+
+    let mut cursor = 33usize; // signature + IHDR chunk and CRC
+    let mut saw_idat = false;
+    let mut idat_ended = false;
+    let mut idat_chunks = Vec::new();
+    let mut idat_size = 0usize;
+    loop {
+        let chunk_header = png.get(cursor..cursor.checked_add(8)?)?;
+        let chunk_len = u32::from_be_bytes(chunk_header[..4].try_into().ok()?) as usize;
+        let chunk_type = &chunk_header[4..8];
+        let data_start = cursor.checked_add(8)?;
+        let data_end = data_start.checked_add(chunk_len)?;
+        let chunk_end = data_end.checked_add(4)?; // CRC
+        let data = png.get(data_start..data_end)?;
+        png.get(data_end..chunk_end)?; // CRC bytes must be present
+        cursor = chunk_end;
+        if chunk_type == b"IDAT" {
+            idat_size = idat_size.checked_add(chunk_len)?;
+            if idat_ended || idat_size > MAX_STEALTH_IDAT_BYTES {
+                return None;
+            }
+            saw_idat = true;
+            idat_chunks.push(data);
+        } else {
+            if saw_idat {
+                idat_ended = true;
+            }
+            if chunk_type == b"IEND" {
+                break;
+            }
+        }
+    }
+    if !saw_idat || idat_size == 0 {
+        return None;
+    }
+
+    let channel_count = match color_type {
+        2 => 3usize,
+        4 => 2usize,
+        6 => 4usize,
+        _ => return None,
+    };
+    let bytes_per_sample = if bit_depth == 16 { 2usize } else { 1usize };
+    let bytes_per_pixel = channel_count.checked_mul(bytes_per_sample)?;
+    let row_bytes = width.checked_mul(bytes_per_pixel)?;
+    let decoded_size = row_bytes.checked_add(1)?.checked_mul(height)?;
+    if decoded_size > MAX_STEALTH_DECODED_PNG_BYTES {
+        return None;
+    }
+
+    let mut decoded = Vec::with_capacity(decoded_size);
+    let mut decoder = ZlibDecoder::new(PngIdatReader::new(idat_chunks))
+        .take(decoded_size as u64 + 1);
+    decoder.read_to_end(&mut decoded).ok()?;
+    if decoded.len() != decoded_size {
+        return None;
+    }
+
+    // PNGフィルターを行単位で解除する。各行をインプレースで復元するため、
+    // 画像全体の追加コピーを作らない。
+    for y in 0..height {
+        let row_start = y.checked_mul(row_bytes.checked_add(1)?)?;
+        let previous_start = if y == 0 { None } else { Some(row_start - row_bytes) };
+        let filter = *decoded.get(row_start)?;
+        if filter > 4 {
+            return None;
+        }
+        for x in 0..row_bytes {
+            let index = row_start + 1 + x;
+            let raw = decoded[index];
+            let left = if x >= bytes_per_pixel { decoded[index - bytes_per_pixel] } else { 0 };
+            let above = previous_start.map(|start| decoded[start + x]).unwrap_or(0);
+            let upper_left = if x >= bytes_per_pixel {
+                previous_start.map(|start| decoded[start + x - bytes_per_pixel]).unwrap_or(0)
+            } else {
+                0
+            };
+            decoded[index] = match filter {
+                0 => raw,
+                1 => raw.wrapping_add(left),
+                2 => raw.wrapping_add(above),
+                3 => raw.wrapping_add(((left as u16 + above as u16) / 2) as u8),
+                4 => raw.wrapping_add(paeth_predictor(left, above, upper_left)),
+                _ => unreachable!(),
+            };
         }
     }
 
-    // シグネチャ "stealth_pnginfo" 等のバイナリを検索
-    // 本来はビットストリームをバイト列に戻して解析するが、簡易的にチェック
-    // Web側の実装を参考に、ビット列からのデコードが必要。
-    
-    // ここでは単純化のため、見つからない場合は空文字を返す
-    // (Stealthデコードは実装負荷が高いため、今回は主要なシグネチャ検出のみ考慮)
-    Ok(String::new()) 
+    let total_pixels = width.checked_mul(height)?;
+    for mode in ["Alpha", "RGB"] {
+        let mode_channels = match (mode, color_type) {
+            ("Alpha", 4) => vec![1usize],
+            ("Alpha", 6) => vec![3usize],
+            ("RGB", 2 | 6) => vec![0usize, 1usize, 2usize],
+            _ => continue,
+        };
+        let channel_bits = total_pixels.checked_mul(mode_channels.len())?;
+        if channel_bits < STEALTH_HEADER_BITS {
+            continue;
+        }
+
+        let read_stream_byte = |byte_index: usize| -> Option<u8> {
+            let mut result = 0u8;
+            for bit_in_byte in 0..8 {
+                let bit_index = byte_index.checked_mul(8)?.checked_add(bit_in_byte)?;
+                if bit_index >= channel_bits {
+                    return None;
+                }
+                let (pixel_index, channel) = if mode == "Alpha" {
+                    (bit_index, mode_channels[0])
+                } else {
+                    (bit_index / 3, mode_channels[bit_index % 3])
+                };
+                // 拡張機能と同じ列優先の座標: pixelIndex = x * height + y。
+                let x = pixel_index / height;
+                let y = pixel_index % height;
+                let row_start = y.checked_mul(row_bytes.checked_add(1)?)?;
+                let sample_offset = if bit_depth == 16 { 1 } else { 0 };
+                let sample_index = x.checked_mul(bytes_per_pixel)?
+                    .checked_add(channel.checked_mul(bytes_per_sample)?)?
+                    .checked_add(sample_offset)?;
+                let value = *decoded.get(row_start.checked_add(1)?.checked_add(sample_index)?)? & 1;
+                result |= value << (7 - bit_in_byte);
+            }
+            Some(result)
+        };
+
+        let mut header = [0u8; STEALTH_SIGNATURE_BYTES + 4];
+        for (index, byte) in header.iter_mut().enumerate() {
+            *byte = read_stream_byte(index)?;
+        }
+        let signature_bytes = &header[..STEALTH_SIGNATURE_BYTES];
+        let (signature, signature_mode, compressed) = if signature_bytes == b"stealth_pnginfo" {
+            ("stealth_pnginfo", "Alpha", false)
+        } else if signature_bytes == b"stealth_pngcomp" {
+            ("stealth_pngcomp", "Alpha", true)
+        } else if signature_bytes == b"stealth_rgbinfo" {
+            ("stealth_rgbinfo", "RGB", false)
+        } else if signature_bytes == b"stealth_rgbcomp" {
+            ("stealth_rgbcomp", "RGB", true)
+        } else {
+            continue;
+        };
+        if signature_mode != mode {
+            continue;
+        }
+        let bit_length = u32::from_be_bytes(header[STEALTH_SIGNATURE_BYTES..].try_into().ok()?) as usize;
+        if bit_length % 8 != 0 {
+            continue;
+        }
+        let payload_len = bit_length / 8;
+        if payload_len > MAX_STEALTH_PAYLOAD_BYTES ||
+            STEALTH_HEADER_BITS.checked_add(bit_length)? > channel_bits {
+            continue;
+        }
+        let mut payload = Vec::with_capacity(payload_len);
+        for index in 0..payload_len {
+            payload.push(read_stream_byte(header.len().checked_add(index)?)?);
+        }
+        let text_bytes = if compressed {
+            let Some(output) = inflate_stealth_payload(&payload) else {
+                continue;
+            };
+            output
+        } else {
+            payload
+        };
+        if let Ok(text) = String::from_utf8(text_bytes) {
+            return Some((mode.to_string(), signature.to_string(), text));
+        }
+    }
+    None
+}
+
+fn inflate_stealth_payload(payload: &[u8]) -> Option<Vec<u8>> {
+    read_limited_payload(GzDecoder::new(payload))
+        .or_else(|| read_limited_payload(ZlibDecoder::new(payload)))
+}
+
+fn read_limited_payload<R: Read>(reader: R) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut reader = reader.take(MAX_STEALTH_PAYLOAD_BYTES as u64 + 1);
+    if reader.read_to_end(&mut output).is_err() || output.len() > MAX_STEALTH_PAYLOAD_BYTES {
+        return None;
+    }
+    Some(output)
+}
+
+fn paeth_predictor(left: u8, above: u8, upper_left: u8) -> u8 {
+    let left = left as i32;
+    let above = above as i32;
+    let upper_left = upper_left as i32;
+    let predictor = left + above - upper_left;
+    let left_distance = (predictor - left).abs();
+    let above_distance = (predictor - above).abs();
+    let upper_left_distance = (predictor - upper_left).abs();
+    if left_distance <= above_distance && left_distance <= upper_left_distance {
+        left as u8
+    } else if above_distance <= upper_left_distance {
+        above as u8
+    } else {
+        upper_left as u8
+    }
 }
 
 fn extract_webp_metadata(mmap: &[u8], path: &str) -> Result<(), Box<dyn std::error::Error>> {
