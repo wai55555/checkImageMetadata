@@ -1,28 +1,44 @@
 # fast_meta
 
-高速な画像メタデータ抽出ツール
+PNG、JPEG、WebP から AI 画像生成のプロンプトや生成情報を抽出する CLI です。入力は1ファイルで、メタデータを人間可読テキストとして標準出力に表示します。
 
-## 概要
+## 対応形式
 
-PNG、WebP、JPEGファイルからメタデータを高速に抽出するコマンドラインツールです。
-AI画像生成ツール（Stable Diffusion、ComfyUI、NovelAIなど）で生成された画像のプロンプトやパラメータを表示できます。
-PNGのチャンクデータ読み込みは、通常のテキストに加え圧縮テキスト (zlib) にも対応しています。また、試験的にαチャンネル等にメタデータを埋め込む「Stealth PNG Info」の検知機能も追加されました。
+- **PNG**: `tEXt`、`zTXt`、`iTXt`、`eXIf`、XMP、IEND 後の trailing data、Stealth PNG Info
+- **JPEG**: EXIF/TIFF、XMP と Extended XMP、COM コメント、APP13/IPTC Caption
+- **WebP**: EXIF/TIFF、XMP
 
-## 特徴
+PNG の登録対象キーワードには A1111/Forge (`parameters`)、ComfyUI (`prompt`, `workflow`, `generation_data`)、NovelAI (`Description`, `Comment`)、SwarmUI、InvokeAI が含まれます。XMP から Draw Things、Midjourney、IPTC `AIPromptInformation` などを抽出します。
 
-- **極めて高速**: メモリマップドファイルを使用したゼロコピー読み込みに加え、段階的なスキャンフロー（初回64KB + 必要な場合のみ追加シーク）を採用
-- **効率的**: チャンク指紋（Fingerprint）判定により、ComfyUI等の巨大なワークフローを持つ画像に対しても最小限のIOで解析
-- **対応フォーマット**:
-  - PNG (tEXtチャンク / 圧縮iTXtチャンク / Stealth Info)
-  - WebP (EXIFチャンク / XMPチャンク)
-  - JPEG (EXIFメタデータ)
+## 使い方
 
-## 対応メタデータ
+```text
+fast_meta [--strict] [--stealth <auto|always|never>] <image_file>
+```
 
-- **Stable Diffusion (A1111/Forge)**: `parameters`
-- **ComfyUI**: `prompt`, `workflow` (末尾データの検知に対応)
-- **NovelAI**: `Description` (Prompt), `Comment` (Settings JSON, 圧縮形式に対応)
-- **EXIF / XMP**: `UserComment`, `ImageDescription`, `parameters`
+```powershell
+.\fast_meta.exe image.png
+.\fast_meta.exe --strict image.png
+.\fast_meta.exe --stealth always image.png
+```
+
+- `--stealth auto` は既定値です。通常のメタデータがない場合に Stealth PNG Info を調べます。
+- `--stealth always` は通常メタデータと Stealth の両方を調べます。
+- `--stealth never` は Stealth の検査を行いません。
+- `--strict` は PNG の IDAT 列を含む全チャンクを走査します。
+
+既定の高速 PNG 走査では、連続する IDAT チャンクの間に置かれたテキストチャンクは検出しません（既知の制約 D-17）。この配置のテキストを調べるには `--strict` を指定してください。
+
+Stealth PNG は非インターレースのカラータイプ 2 / 4 / 6、8bit / 16bit を対象とします。Adam7 インターレースには対応していません。
+
+## サイズ上限
+
+- `tEXt` 本文: 明示的な上限なし
+- `zTXt` / 圧縮 `iTXt`: 解凍後 64 MB / チャンク
+- XMP パケット: 16 MB
+- EXIF ブロック: 16 MB
+- Stealth PNG: 最大寸法 16,384、解凍後 512 MB、ペイロード 8 MB、IDAT 合計 512 MB
+- IEND 後の trailing data: 先頭 1 MB を走査
 
 ## ビルド
 
@@ -30,54 +46,20 @@ PNGのチャンクデータ読み込みは、通常のテキストに加え圧�
 cargo build --release
 ```
 
-実行ファイルは `target\release\fast_meta.exe` に生成されます。
-
-既定では `zlib-ng` backend を使います。ビルド環境に C コンパイラがなく、
-この backend をビルドできない場合は、純 Rust の `miniz_oxide` backend を選べます。
+既定では高速な `zlib-ng` backend を使用します。ビルド環境に C コンパイラがなく `zlib-ng` をビルドできない場合は、純 Rust の `miniz_oxide` backend を選択できます。
 
 ```powershell
 cargo build --release --no-default-features --features portable-zlib
 ```
 
-## 使い方
-
-```powershell
-fast_meta.exe <画像ファイル>
-```
-
-### 例
-
-```powershell
-# PNGファイルのメタデータを表示 (圧縮されたNovelAI画像や巨大なComfyUI画像に対応)
-.\fast_meta.exe image.png
-
-# WebPファイルのメタデータを表示 (EXIFおよびXMPに対応)
-.\fast_meta.exe image.webp
-```
-
-## 技術詳細
-
-- **段階的スキャンフロー**:
-  1. **Fast Scan (64KB)**: 先頭64KBを読み込み、標準的なメタデータを抽出。
-  2. **Fingerprint判定**: IHDR直後のチャンク構造からComfyUI等の特定ライブラリを判別。
-  3. **Tail Scan**: 必要な場合のみ、ファイル末尾128KBをシークして巨大ワークフローを抽出。
-- **メモリマップドI/O**: `memmap2` を使用した高速ファイル読み込み。
-- **圧縮解凍**: `flate2` を使用した iTXt の zlib 解凍と Stealth PNG の gzip / zlib 解凍。
-- **LSB解析**: PNGのIDAT展開と行フィルター復元後に、RGB / αチャンネルのLSBからStealth PNG Infoを復元。
-
-## 依存関係とライブラリ
-
-本プロジェクトでは以下のライブラリおよび技術を使用しています。
-
-- **zlib**: データの圧縮・解凍に使用。
-  - 入手先: [zlib Home Site](https://zlib.net/) / [GitHub (madler/zlib)](https://github.com/madler/zlib)
-- **Rust Crates**:
-  - `flate2`: zlib (Deflate) のデコード
-  - `image`: 画像処理ライブラリ
-  - `memmap2`: 高速なファイルアクセス
-  - `serde_json`: JSONのパースと整形
-  - `kamadak-exif`: EXIF情報の定義参照
-
 ## ライセンス
 
 MIT
+
+## 外部ツールとの照合
+
+ExifTool が利用できる場合は、同じ画像に対して次を実行して出力を比較できます。
+
+```text
+exiftool -G1 -a -s <image_file>
+```

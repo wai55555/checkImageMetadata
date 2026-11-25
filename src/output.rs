@@ -33,6 +33,16 @@ impl<'a> TextSink<'a> {
             }
         }
 
+        if self.records.len() == 1 {
+            let record = self.records.pop().expect("one record was checked");
+            writer.write_all(b"--- ")?;
+            writer.write_all(record.label.as_bytes())?;
+            writer.write_all(b" ---\n")?;
+            writer.write_all(record.body.as_bytes())?;
+            writer.write_all(b"\n")?;
+            return Ok(());
+        }
+
         let mut merged: Vec<MergedRecord<'a>> = Vec::new();
         let mut body_groups: HashMap<(usize, u64), Vec<BodyGroup<'a>>> = HashMap::new();
         for record in self.records.drain(..) {
@@ -210,7 +220,7 @@ mod tests {
     use crate::record::{MetadataSink, RecordView, Source};
 
     #[test]
-    fn text_sink_preserves_heading_body_and_line_breaks() {
+    fn text_sink_single_record_preserves_heading_body_and_line_breaks() {
         let record = RecordView {
             source: Source::PngText,
             label: Cow::Borrowed("Stable Diffusion (A1111)"),

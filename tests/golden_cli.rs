@@ -218,6 +218,19 @@ fn golden_a1111_png_parameters_at_start() {
 }
 
 #[test]
+fn golden_png_records_keep_file_order_through_buffered_stdout() {
+    let mut metadata = text_chunk("Title", "first");
+    metadata.extend_from_slice(&text_chunk("parameters", "second"));
+    let png = simple_png(metadata);
+
+    assert_cli_golden(
+        "png",
+        &png,
+        "=== PNG File: <fixture> ===\n--- Title ---\nfirst\n--- Stable Diffusion (A1111) ---\nsecond\n",
+    );
+}
+
+#[test]
 fn golden_comfyui_png_workflow_after_idat() {
     let png = comfy_png_with_tail_workflow();
     assert_cli_golden(

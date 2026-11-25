@@ -9,19 +9,23 @@ pub mod xmp;
 use flate2::read::{GzDecoder, ZlibDecoder};
 use memmap2::MmapOptions;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 
-fn extract_png_metadata(
+fn extract_png_metadata<W: Write>(
     mmap: &[u8],
     path: &str,
     strict: bool,
     stealth_policy: StealthPolicy,
+    writer: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::output::TextSink;
     let result = png::scan(mmap, strict);
-    println!("=== PNG File: {} ===", path);
+    writeln!(writer, "=== PNG File: {} ===", path)?;
     if result.stats.comfy_tail_notice {
-        println!("(Large file or ComfyUI detected. Scanning tail for metadata...)");
+        writeln!(
+            writer,
+            "(Large file or ComfyUI detected. Scanning tail for metadata...)"
+        )?;
     }
     let has_normal_metadata = result.records.iter().any(|record| {
         matches!(
@@ -57,10 +61,10 @@ fn extract_png_metadata(
         });
     }
     let has_any_metadata_record = !sink.is_empty();
-    sink.flush(&mut io::stdout().lock())?;
+    sink.flush(writer)?;
 
     if !has_any_metadata_record {
-        println!("(No metadata detected)");
+        writeln!(writer, "(No metadata detected)")?;
     }
 
     Ok(())
@@ -641,16 +645,20 @@ fn unfilter_png_row(
     Some(())
 }
 
-fn extract_webp_metadata(mmap: &[u8], path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== WebP File: {} ===", path);
+fn extract_webp_metadata<W: Write>(
+    mmap: &[u8],
+    path: &str,
+    writer: &mut W,
+) -> Result<(), Box<dyn std::error::Error>> {
+    writeln!(writer, "=== WebP File: {} ===", path)?;
     let mut sink = output::TextSink::default();
     for record in webp_records(mmap) {
         sink.push_record(record);
     }
     let found = !sink.is_empty();
-    sink.flush(&mut io::stdout().lock())?;
+    sink.flush(writer)?;
     if !found {
-        println!("(No metadata detected)");
+        writeln!(writer, "(No metadata detected)")?;
     }
     Ok(())
 }
@@ -705,45 +713,49 @@ fn webp_records(mmap: &[u8]) -> Vec<record::RecordView<'_>> {
     records
 }
 
-fn extract_exif_metadata(
+fn extract_exif_metadata<W: Write>(
     mmap: &[u8],
     path: &str,
     format: &str,
+    writer: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== {} File: {} ===", format, path);
+    writeln!(writer, "=== {} File: {} ===", format, path)?;
     let parsed = jpeg::scan(mmap);
     let has_records = !parsed.records.is_empty();
     let mut sink = output::TextSink::default();
     for record in parsed.records {
         sink.push_record(record);
     }
-    sink.flush(&mut io::stdout().lock())?;
+    sink.flush(writer)?;
     if !has_records {
         if parsed.saw_exif {
-            println!("(No metadata detected)");
+            writeln!(writer, "(No metadata detected)")?;
         } else {
-            println!("(No EXIF marker found)");
+            writeln!(writer, "(No EXIF marker found)")?;
         }
     }
     Ok(())
 }
 
-fn extract_universal_metadata(
+fn extract_universal_metadata<W: Write>(
     path: &str,
     strict: bool,
     stealth_policy: StealthPolicy,
+    writer: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let mmap = unsafe { MmapOptions::new().map(&file)? };
 
     if mmap.len() >= 8 && &mmap[0..8] == &[137, 80, 78, 71, 13, 10, 26, 10] {
-        return extract_png_metadata(&mmap, path, strict, stealth_policy);
+        return extract_png_metadata(&mmap, path, strict, stealth_policy, writer);
     }
     if mmap.len() >= 12 && &mmap[0..4] == b"RIFF" && &mmap[8..12] == b"WEBP" {
-        return extract_webp_metadata(&mmap, path);
+        return extract_webp_metadata(&mmap, path, writer);
     }
     if mmap.len() >= 3 && &mmap[0..3] == &[0xFF, 0xD8, 0xFF] {
-        return extract_exif_metadata(&mmap, path, "JPEG");
+        #[cfg(unix)]
+        let _ = mmap.advise(memmap2::Advice::Random);
+        return extract_exif_metadata(&mmap, path, "JPEG", writer);
     }
 
     eprintln!("Unsupported file format");
@@ -789,7 +801,15 @@ fn main() {
         );
         std::process::exit(1);
     };
-    if let Err(e) = extract_universal_metadata(image_path, strict, stealth_policy) {
+    let stdout = io::stdout();
+    let mut writer = io::BufWriter::new(stdout.lock());
+    let result = extract_universal_metadata(image_path, strict, stealth_policy, &mut writer);
+    let flush_result = writer.flush();
+    if let Err(e) = result {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
+    if let Err(e) = flush_result {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
