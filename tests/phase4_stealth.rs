@@ -73,6 +73,20 @@ fn stealth_png_variant(
     compressed: bool,
     text_chunk: Option<Vec<u8>>,
 ) -> Vec<u8> {
+    stealth_png_variant_with_max_height(
+        payload, signature, bit_depth, rgb, compressed, text_chunk, 23,
+    )
+}
+
+fn stealth_png_variant_with_max_height(
+    payload: &[u8],
+    signature: &str,
+    bit_depth: u8,
+    rgb: bool,
+    compressed: bool,
+    text_chunk: Option<Vec<u8>>,
+    max_height: usize,
+) -> Vec<u8> {
     let encoded_payload = if compressed {
         compress(payload)
     } else {
@@ -85,7 +99,7 @@ fn stealth_png_variant(
     // Use multiple columns so fixtures cover the extension's column-major pixel order.
     let channels_per_stream_pixel = if rgb { 3 } else { 1 };
     let stream_pixel_count = (stream.len() * 8).div_ceil(channels_per_stream_pixel);
-    let height = stream_pixel_count.min(23);
+    let height = stream_pixel_count.min(max_height);
     let width = stream_pixel_count.div_ceil(height);
     let bytes_per_sample = usize::from(bit_depth / 8);
     let row_bytes = width * 4 * bytes_per_sample;
@@ -153,6 +167,24 @@ fn stealth_png_variant(
     png.extend_from_slice(&png_chunk(b"IDAT", &compress(&filtered)));
     png.extend_from_slice(&png_chunk(b"IEND", &[]));
     png
+}
+
+fn corrupt_idat_zlib_checksum(mut png: Vec<u8>) -> Vec<u8> {
+    let mut cursor = PNG_SIGNATURE.len();
+    loop {
+        let chunk_len = u32::from_be_bytes(png[cursor..cursor + 4].try_into().unwrap()) as usize;
+        let chunk_type = &png[cursor + 4..cursor + 8];
+        let data_start = cursor + 8;
+        let data_end = data_start + chunk_len;
+        if chunk_type == b"IDAT" {
+            assert!(chunk_len >= 4);
+            png[data_end - 1] ^= 1;
+            let crc = crc32fast::hash(&png[cursor + 4..data_end]);
+            png[data_end..data_end + 4].copy_from_slice(&crc.to_be_bytes());
+            return png;
+        }
+        cursor = data_end + 4;
+    }
 }
 
 fn text_chunk(keyword: &str, text: &str) -> Vec<u8> {
@@ -264,6 +296,41 @@ fn fixture_31_reads_compressed_stealth_payload() {
 
     assert!(output.contains("Stealth PNG Info (Alpha) [stealth_pngcomp]"));
     assert!(output.contains("fixture 31 compressed payload"));
+}
+
+#[test]
+fn stealth_prefix_match_continues_the_same_decoder_to_finish_the_image() {
+    let bytes = stealth_png_variant_with_max_height(
+        b"matched prefix must still validate the remaining stream",
+        "stealth_pnginfo",
+        8,
+        false,
+        false,
+        None,
+        240,
+    );
+    let png = TempPng::new(&corrupt_idat_zlib_checksum(bytes));
+    let output = run_cli(&[png.path.to_str().unwrap()]);
+
+    assert!(output.contains("(No metadata detected)"));
+    assert!(!output.contains("matched prefix"));
+}
+
+#[test]
+fn stealth_prefix_match_returns_metadata_after_stream_completion() {
+    let bytes = stealth_png_variant_with_max_height(
+        b"fixture after prefix completion",
+        "stealth_pnginfo",
+        8,
+        false,
+        false,
+        None,
+        240,
+    );
+    let png = TempPng::new(&bytes);
+    let output = run_cli(&[png.path.to_str().unwrap()]);
+
+    assert!(output.contains("fixture after prefix completion"));
 }
 
 #[test]

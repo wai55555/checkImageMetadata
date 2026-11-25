@@ -217,6 +217,88 @@ impl StealthPolicy {
     }
 }
 
+fn has_stealth_header(
+    decoded: &[u8],
+    width: usize,
+    height: usize,
+    available_rows: usize,
+    row_bytes: usize,
+    bytes_per_pixel: usize,
+    bytes_per_sample: usize,
+    color_type: u8,
+) -> Option<bool> {
+    let total_pixels = width.checked_mul(height)?;
+    for mode in ["Alpha", "RGB"] {
+        let sample_channel = match (mode, color_type) {
+            ("Alpha", 4) => Some(1usize),
+            ("Alpha", 6) => Some(3usize),
+            ("RGB", 2 | 6) => None,
+            _ => continue,
+        };
+        let Some(mut bit_cursor) = StealthBitCursor::new(
+            decoded,
+            width,
+            height,
+            available_rows,
+            row_bytes,
+            bytes_per_pixel,
+            bytes_per_sample,
+            sample_channel,
+        ) else {
+            continue;
+        };
+        if bit_cursor.bit_capacity < STEALTH_HEADER_BITS {
+            continue;
+        }
+
+        let mut header = [0u8; STEALTH_SIGNATURE_BYTES + 4];
+        let mut complete = true;
+        for byte in &mut header {
+            if let Some(value) = bit_cursor.next_byte() {
+                *byte = value;
+            } else {
+                complete = false;
+                break;
+            }
+        }
+        if !complete {
+            continue;
+        }
+
+        let signature_bytes = &header[..STEALTH_SIGNATURE_BYTES];
+        let signature_info = if signature_bytes == b"stealth_pnginfo" {
+            Some(("stealth_pnginfo", "Alpha", false))
+        } else if signature_bytes == b"stealth_pngcomp" {
+            Some(("stealth_pngcomp", "Alpha", true))
+        } else if signature_bytes == b"stealth_rgbinfo" {
+            Some(("stealth_rgbinfo", "RGB", false))
+        } else if signature_bytes == b"stealth_rgbcomp" {
+            Some(("stealth_rgbcomp", "RGB", true))
+        } else {
+            None
+        };
+        let Some((_, signature_mode, _)) = signature_info else {
+            continue;
+        };
+        if signature_mode != mode {
+            continue;
+        }
+        let bit_length =
+            u32::from_be_bytes(header[STEALTH_SIGNATURE_BYTES..].try_into().ok()?) as usize;
+        if bit_length % 8 != 0 {
+            continue;
+        }
+        let channel_bits = total_pixels.checked_mul(if mode == "Alpha" { 1 } else { 3 })?;
+        if bit_length / 8 > MAX_STEALTH_PAYLOAD_BYTES
+            || STEALTH_HEADER_BITS.checked_add(bit_length)? > channel_bits
+        {
+            continue;
+        }
+        return Some(true);
+    }
+    Some(false)
+}
+
 struct PngIdatReader<'a> {
     chunks: Vec<&'a [u8]>,
     chunk_index: usize,
@@ -324,22 +406,58 @@ fn check_stealth_png(png: &[u8]) -> Option<(String, String, String)> {
     let bytes_per_sample = if bit_depth == 16 { 2usize } else { 1usize };
     let bytes_per_pixel = channel_count.checked_mul(bytes_per_sample)?;
     let row_bytes = width.checked_mul(bytes_per_pixel)?;
-    let decoded_size = row_bytes.checked_add(1)?.checked_mul(height)?;
+    let row_stride = row_bytes.checked_add(1)?;
+    let decoded_size = row_stride.checked_mul(height)?;
     if decoded_size > MAX_STEALTH_DECODED_PNG_BYTES {
         return None;
     }
 
-    let mut decoded = Vec::with_capacity(decoded_size);
+    let header_rows = if matches!(color_type, 4 | 6) {
+        STEALTH_HEADER_BITS
+    } else {
+        STEALTH_HEADER_BITS.checked_add(2)? / 3
+    };
+    let prefix_rows = height.min(header_rows);
+    let prefix_size = row_stride.checked_mul(prefix_rows)?;
     let mut decoder =
         ZlibDecoder::new(PngIdatReader::new(idat_chunks)).take(decoded_size as u64 + 1);
-    decoder.read_to_end(&mut decoded).ok()?;
-    if decoded.len() != decoded_size {
+    let mut decoded = vec![0; prefix_size];
+    decoder.read_exact(&mut decoded).ok()?;
+
+    // Only complete rows enter the buffer and can be observed by the bit cursor.
+    for y in 0..prefix_rows {
+        unfilter_png_row(&mut decoded, y, row_bytes, bytes_per_pixel)?;
+    }
+    if !has_stealth_header(
+        &decoded,
+        width,
+        height,
+        prefix_rows,
+        row_bytes,
+        bytes_per_pixel,
+        bytes_per_sample,
+        color_type,
+    )? {
         return None;
     }
 
-    // Full expansion verified the complete decoded size; restore each row in place.
-    for y in 0..height {
+    // A matching header justifies finishing the same stream; the already unfiltered prefix stays
+    // in place and only the remaining complete rows are appended and restored.
+    for y in prefix_rows..height {
+        let row_end = decoded.len().checked_add(row_stride)?;
+        let previous_len = decoded.len();
+        decoded.resize(row_end, 0);
+        decoder
+            .read_exact(decoded.get_mut(previous_len..row_end)?)
+            .ok()?;
         unfilter_png_row(&mut decoded, y, row_bytes, bytes_per_pixel)?;
+    }
+    if decoded.len() != decoded_size {
+        return None;
+    }
+    let mut extra = [0u8; 1];
+    if decoder.read(&mut extra).ok()? != 0 {
+        return None;
     }
 
     for mode in ["Alpha", "RGB"] {
