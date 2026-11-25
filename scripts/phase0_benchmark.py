@@ -81,11 +81,14 @@ def safe_noisy_rgb_stream(width: int, height: int, seed: int, level: int) -> byt
 def generate_comfy_png(path: Path) -> None:
     # 2048 × 1700 RGB scanlines produce a zlib IDAT of approximately 10 MB.
     compressed = safe_noisy_rgb_stream(2048, 1700, seed=20261126, level=1)
+    first_idat = compressed[:65_536]
+    if len(first_idat) != 65_536:
+        raise RuntimeError("ComfyUI fixture must start with a 65,536-byte IDAT")
     png = make_png(
         2048,
         1700,
         2,
-        [compressed],
+        [first_idat, compressed[65_536:]],
         [text_chunk("workflow", '{"fixture":"comfy-workflow"}')],
     )
     path.write_bytes(png)
@@ -244,9 +247,21 @@ def measure(binary: Path, fixture: Path, warmups: int, iterations: int) -> dict[
     }
 
 
+def validate_expected_output(binary: Path, fixture: Path, markers: tuple[str, ...]) -> None:
+    command = [str(binary.resolve()), str(fixture.resolve())]
+    completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if completed.returncode != 0:
+        raise RuntimeError(f"validation failed for {fixture}: status {completed.returncode}")
+    output = completed.stdout.decode("utf-8", errors="replace")
+    missing = [marker for marker in markers if marker not in output]
+    if missing:
+        raise RuntimeError(f"validation failed for {fixture}: missing output markers {missing!r}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, default=Path("target/release/fast_meta"))
+    default_binary = "target/release/fast_meta.exe" if os.name == "nt" else "target/release/fast_meta"
+    parser.add_argument("--binary", type=Path, default=Path(default_binary))
     parser.add_argument("--output-dir", type=Path, default=Path("target/phase0-fixtures"))
     parser.add_argument("--iterations", type=int, default=15)
     parser.add_argument("--warmups", type=int, default=3)
@@ -260,6 +275,17 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     paths = fixture_paths(args.output_dir)
     generate_fixtures(paths)
+
+    expected_output_markers = {
+        "PNG ComfyUI 10 MiB IDAT + workflow": ("workflow", '"fixture":"comfy-workflow"'),
+        "PNG Stealth 2048x2048 RGBA": ("Stealth PNG Info", "Stealth performance fixture"),
+        "JPEG 5 MiB with EXIF": ("EXIF UserComment", "phase0 JPEG baseline"),
+        "PNG absent, many small IDAT chunks": ("(No metadata detected)",),
+        "PNG absent, browser canvas style": ("(No metadata detected)",),
+        "PNG absent, single large photo IDAT": ("(No metadata detected)",),
+    }
+    for label, path in paths.items():
+        validate_expected_output(args.binary, path, expected_output_markers[label])
 
     results = {
         "environment": {
