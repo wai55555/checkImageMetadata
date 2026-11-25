@@ -32,6 +32,13 @@ cargo build --release
 
 実行ファイルは `target\release\fast_meta.exe` に生成されます。
 
+既定では `zlib-ng` backend を使います。ビルド環境に C コンパイラがなく、
+この backend をビルドできない場合は、純 Rust の `miniz_oxide` backend を選べます。
+
+```powershell
+cargo build --release --no-default-features --features portable-zlib
+```
+
 ## 使い方
 
 ```powershell
