@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::cmp::Reverse;
 use std::collections::HashSet;
 
 use crate::record::{RecordView, Source};
@@ -276,9 +277,31 @@ fn decode_unicode(bytes: &[u8]) -> String {
     if let Some((order, body)) = utf16_bom(bytes) {
         return decode_utf16_order(body, order);
     }
-    // D-09 adds content scoring for BOM-less UNICODE values; BE is a safe
-    // temporary default so this D-08 change remains independently buildable.
-    decode_utf16_order(bytes, Utf16Order::Big)
+    let big_endian = decode_utf16_order(bytes, Utf16Order::Big);
+    let little_endian = decode_utf16_order(bytes, Utf16Order::Little);
+    if utf16_score(&little_endian) < utf16_score(&big_endian) {
+        little_endian
+    } else {
+        big_endian
+    }
+}
+
+fn utf16_score(text: &str) -> (usize, usize, Reverse<usize>) {
+    let mut controls = 0usize;
+    let mut replacements = 0usize;
+    let mut ascii = 0usize;
+    for character in text.chars() {
+        if matches!(character as u32, 0x0000..=0x0008 | 0x000e..=0x001f) {
+            controls += 1;
+        }
+        if character == '\u{fffd}' {
+            replacements += 1;
+        }
+        if character.is_ascii() {
+            ascii += 1;
+        }
+    }
+    (controls, replacements, Reverse(ascii))
 }
 
 fn decode_undefined_code(bytes: &[u8]) -> Option<Cow<'_, str>> {
@@ -354,7 +377,7 @@ fn trim_trailing_nuls(mut text: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, ByteOrder, TiffReader};
+    use super::{parse, ByteOrder, TiffReader, Utf16Order};
     use crate::record::Source;
 
     fn entry(tag: u16, field_type: u16, count: u32, value: [u8; 4]) -> Vec<u8> {
@@ -475,5 +498,49 @@ mod tests {
         let latin1 = tiff_with_comment(b"ASCII\0\0\0\xe9");
         let decoded = parse(&latin1, Source::JpegExif);
         assert_eq!(decoded[0].body, "é");
+    }
+
+    fn unicode_comment(text: &str, order: Utf16Order, bom: bool) -> Vec<u8> {
+        let mut comment = b"UNICODE\0".to_vec();
+        if bom {
+            comment.extend_from_slice(match order {
+                Utf16Order::Little => &[0xff, 0xfe],
+                Utf16Order::Big => &[0xfe, 0xff],
+            });
+        }
+        for unit in text.encode_utf16() {
+            let bytes = match order {
+                Utf16Order::Little => unit.to_le_bytes(),
+                Utf16Order::Big => unit.to_be_bytes(),
+            };
+            comment.extend_from_slice(&bytes);
+        }
+        comment
+    }
+
+    #[test]
+    fn unicode_user_comment_honors_boms_and_scores_bomless_endianness() {
+        for order in [Utf16Order::Little, Utf16Order::Big] {
+            let expected = "猫parameters=1";
+            for bom in [true, false] {
+                let tiff = tiff_with_comment(&unicode_comment(expected, order, bom));
+                let records = parse(&tiff, Source::JpegExif);
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].body, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_user_comment_preserves_internal_nuls_and_has_no_character_cap() {
+        let expected = "first\0second";
+        let tiff = tiff_with_comment(&unicode_comment(expected, Utf16Order::Little, true));
+        let records = parse(&tiff, Source::JpegExif);
+        assert_eq!(records[0].body, expected);
+
+        let long = "x".repeat(10_001);
+        let tiff = tiff_with_comment(&unicode_comment(&long, Utf16Order::Little, false));
+        let records = parse(&tiff, Source::JpegExif);
+        assert_eq!(records[0].body, long);
     }
 }
