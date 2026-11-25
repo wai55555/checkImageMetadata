@@ -6,140 +6,123 @@ pub struct PngKeyword {
     pub xmp_packet: bool,
 }
 
-pub fn registered() -> [&'static [u8]; 14] {
-    [
-        b"parameters",
-        b"prompt",
-        b"workflow",
-        b"generation_data",
-        b"Description",
-        b"Comment",
-        b"Title",
-        b"Software",
-        b"Source",
-        b"sui_image_params",
-        b"sui_extra_data",
-        b"invokeai_metadata",
-        b"sd-metadata",
-        b"XML:com.adobe.xmp",
-    ]
+static PNG_KEYWORDS: [PngKeyword; 14] = [
+    PngKeyword {
+        name: "parameters",
+        label: "Stable Diffusion (A1111)",
+        json_settings: false,
+        xmp_packet: false,
+    },
+    PngKeyword {
+        name: "prompt",
+        label: "prompt",
+        json_settings: false,
+        xmp_packet: false,
+    },
+    PngKeyword {
+        name: "workflow",
+        label: "workflow",
+        json_settings: false,
+        xmp_packet: false,
+    },
+    PngKeyword {
+        name: "generation_data",
+        label: "generation_data",
+        json_settings: false,
+        xmp_packet: false,
+    },
+    PngKeyword {
+        name: "Description",
+        label: "NovelAI [Prompt]",
+        json_settings: false,
+        xmp_packet: false,
+    },
+    PngKeyword {
+        name: "Comment",
+        label: "NovelAI [Settings]",
+        json_settings: true,
+        xmp_packet: false,
+    },
+    PngKeyword {
+        name: "Title",
+        label: "Title",
+        json_settings: false,
+        xmp_packet: false,
+    },
+    PngKeyword {
+        name: "Software",
+        label: "Software",
+        json_settings: false,
+        xmp_packet: false,
+    },
+    PngKeyword {
+        name: "Source",
+        label: "Source",
+        json_settings: false,
+        xmp_packet: false,
+    },
+    PngKeyword {
+        name: "sui_image_params",
+        label: "SwarmUI [Params]",
+        json_settings: false,
+        xmp_packet: false,
+    },
+    PngKeyword {
+        name: "sui_extra_data",
+        label: "SwarmUI [Extra]",
+        json_settings: false,
+        xmp_packet: false,
+    },
+    PngKeyword {
+        name: "invokeai_metadata",
+        label: "InvokeAI",
+        json_settings: false,
+        xmp_packet: false,
+    },
+    PngKeyword {
+        name: "sd-metadata",
+        label: "sd-metadata",
+        json_settings: false,
+        xmp_packet: false,
+    },
+    PngKeyword {
+        name: "XML:com.adobe.xmp",
+        label: "XMP",
+        json_settings: false,
+        xmp_packet: true,
+    },
+];
+
+pub fn registered() -> impl Iterator<Item = &'static [u8]> {
+    PNG_KEYWORDS.iter().map(|entry| entry.name.as_bytes())
 }
 
 pub fn lookup(keyword: &[u8]) -> Option<PngKeyword> {
-    let entry = match keyword {
-        b"parameters" => PngKeyword {
-            name: "parameters",
-            label: "Stable Diffusion (A1111)",
-            json_settings: false,
-            xmp_packet: false,
-        },
-        b"prompt" => PngKeyword {
-            name: "prompt",
-            label: "prompt",
-            json_settings: false,
-            xmp_packet: false,
-        },
-        b"workflow" => PngKeyword {
-            name: "workflow",
-            label: "workflow",
-            json_settings: false,
-            xmp_packet: false,
-        },
-        b"generation_data" => PngKeyword {
-            name: "generation_data",
-            label: "generation_data",
-            json_settings: false,
-            xmp_packet: false,
-        },
-        b"Description" => PngKeyword {
-            name: "Description",
-            label: "NovelAI [Prompt]",
-            json_settings: false,
-            xmp_packet: false,
-        },
-        b"Comment" => PngKeyword {
-            name: "Comment",
-            label: "NovelAI [Settings]",
-            json_settings: true,
-            xmp_packet: false,
-        },
-        b"Title" => PngKeyword {
-            name: "Title",
-            label: "Title",
-            json_settings: false,
-            xmp_packet: false,
-        },
-        b"Software" => PngKeyword {
-            name: "Software",
-            label: "Software",
-            json_settings: false,
-            xmp_packet: false,
-        },
-        b"Source" => PngKeyword {
-            name: "Source",
-            label: "Source",
-            json_settings: false,
-            xmp_packet: false,
-        },
-        b"sui_image_params" => PngKeyword {
-            name: "sui_image_params",
-            label: "SwarmUI [Params]",
-            json_settings: false,
-            xmp_packet: false,
-        },
-        b"sui_extra_data" => PngKeyword {
-            name: "sui_extra_data",
-            label: "SwarmUI [Extra]",
-            json_settings: false,
-            xmp_packet: false,
-        },
-        b"invokeai_metadata" => PngKeyword {
-            name: "invokeai_metadata",
-            label: "InvokeAI",
-            json_settings: false,
-            xmp_packet: false,
-        },
-        b"sd-metadata" => PngKeyword {
-            name: "sd-metadata",
-            label: "sd-metadata",
-            json_settings: false,
-            xmp_packet: false,
-        },
-        b"XML:com.adobe.xmp" => PngKeyword {
-            name: "XML:com.adobe.xmp",
-            label: "XMP",
-            json_settings: false,
-            xmp_packet: true,
-        },
-        _ => return None,
-    };
-    Some(entry)
+    PNG_KEYWORDS
+        .iter()
+        .find(|entry| entry.name.as_bytes() == keyword)
+        .copied()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::lookup;
+    use super::{lookup, registered, PNG_KEYWORDS};
 
     #[test]
-    fn registry_contains_only_the_specified_png_keywords() {
-        let keys: [&[u8]; 14] = [
-            b"parameters",
-            b"prompt",
-            b"workflow",
-            b"generation_data",
-            b"Description",
-            b"Comment",
-            b"Title",
-            b"Software",
-            b"Source",
-            b"sui_image_params",
-            b"sui_extra_data",
-            b"invokeai_metadata",
-            b"sd-metadata",
-            b"XML:com.adobe.xmp",
-        ];
-        for key in keys {
-            assert!(lookup(key).is_some(), "missing keyword: {key:?}");
+    fn registry_is_the_single_source_for_scanning_and_lookup() {
+        let registered: Vec<_> = registered().collect();
+        let table: Vec<_> = PNG_KEYWORDS
+            .iter()
+            .map(|entry| entry.name.as_bytes())
+            .collect();
+        assert_eq!(registered, table);
+        assert_eq!(registered.len(), 14);
+
+        for (index, entry) in PNG_KEYWORDS.iter().enumerate() {
+            assert_eq!(lookup(entry.name.as_bytes()), Some(*entry));
+            assert!(!PNG_KEYWORDS[index + 1..]
+                .iter()
+                .any(|next| next.name == entry.name));
         }
         assert!(lookup(b"Author").is_none());
         assert!(lookup(b"PARAMETERS").is_none());
@@ -154,16 +137,5 @@ mod tests {
         assert_eq!(lookup(b"sui_extra_data").unwrap().label, "SwarmUI [Extra]");
         assert_eq!(lookup(b"invokeai_metadata").unwrap().label, "InvokeAI");
         assert_eq!(lookup(b"sd-metadata").unwrap().label, "sd-metadata");
-    }
-
-    #[test]
-    fn registered_keyword_list_matches_the_registry() {
-        for keyword in super::registered() {
-            assert!(
-                lookup(keyword).is_some(),
-                "unregistered key in scan list: {keyword:?}"
-            );
-        }
-        assert_eq!(super::registered().len(), 14);
     }
 }
