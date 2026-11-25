@@ -377,9 +377,9 @@ fn decode_undefined_code(bytes: &[u8]) -> Option<Cow<'_, str>> {
                     (even, odd)
                 }
             });
-    if even_zeroes > odd_zeroes {
+    if even_zeroes >= 2 && even_zeroes > odd_zeroes.saturating_mul(2) {
         Some(Cow::Owned(decode_utf16_order(bytes, Utf16Order::Big)))
-    } else if odd_zeroes > even_zeroes {
+    } else if odd_zeroes >= 2 && odd_zeroes > even_zeroes.saturating_mul(2) {
         Some(Cow::Owned(decode_utf16_order(bytes, Utf16Order::Little)))
     } else {
         decode_utf8_or_latin1(bytes)
@@ -581,6 +581,16 @@ mod tests {
         let latin1 = tiff_with_comment(b"ASCII\0\0\0\xe9");
         let decoded = parse(&latin1, Source::JpegExif);
         assert_eq!(decoded[0].body, "é");
+    }
+
+    #[test]
+    fn undefined_charset_does_not_treat_one_ascii_nul_as_utf16() {
+        let mut comment = vec![0; 8];
+        comment.extend_from_slice(b"ab\0");
+        let tiff = tiff_with_comment(&comment);
+        let records = parse(&tiff, Source::JpegExif);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].body, "ab");
     }
 
     fn unicode_comment(text: &str, order: Utf16Order, bom: bool) -> Vec<u8> {
