@@ -15,6 +15,7 @@ fn extract_png_metadata(
     mmap: &[u8],
     path: &str,
     strict: bool,
+    stealth_policy: StealthPolicy,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::output::TextSink;
     let result = png::scan(mmap, strict);
@@ -22,19 +23,43 @@ fn extract_png_metadata(
     if result.stats.comfy_tail_notice {
         println!("(Large file or ComfyUI detected. Scanning tail for metadata...)");
     }
-    let has_metadata = !result.records.is_empty();
+    let has_normal_metadata = result.records.iter().any(|record| {
+        matches!(
+            record.source,
+            record::Source::PngText
+                | record::Source::PngExif
+                | record::Source::PngXmp
+                | record::Source::JpegExif
+                | record::Source::JpegXmp
+                | record::Source::JpegComment
+                | record::Source::JpegIptc
+                | record::Source::WebpExif
+                | record::Source::WebpXmp
+                | record::Source::TiffXmp
+        )
+    });
+    let stealth_result = match stealth_policy {
+        StealthPolicy::Never => None,
+        StealthPolicy::Auto if has_normal_metadata => None,
+        StealthPolicy::Auto | StealthPolicy::Always => check_stealth_png(mmap),
+    };
     let mut sink = TextSink::default();
     for record in result.records {
         sink.push_record(record);
     }
+    if let Some((mode, signature, body)) = stealth_result.as_ref() {
+        sink.push_record(record::RecordView {
+            source: record::Source::PngStealth,
+            label: std::borrow::Cow::Owned(format!("Stealth PNG Info ({mode}) [{signature}]")),
+            body: std::borrow::Cow::Owned(body.clone()),
+            keyword: None,
+            detail: Some(std::borrow::Cow::Owned(format!("{mode}/{signature}"))),
+        });
+    }
+    let has_any_metadata_record = !sink.is_empty();
     sink.flush(&mut io::stdout().lock())?;
 
-    if !has_metadata {
-        if let Some((mode, signature, stealth_meta)) = check_stealth_png(mmap) {
-            println!("--- Stealth PNG Info ({}) [{}] ---", mode, signature);
-            println!("{}", stealth_meta);
-            return Ok(());
-        }
+    if !has_any_metadata_record {
         println!("(No metadata detected)");
     }
 
@@ -47,6 +72,233 @@ const MAX_STEALTH_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STEALTH_IDAT_BYTES: usize = 512 * 1024 * 1024;
 const STEALTH_HEADER_BITS: usize = ("stealth_pnginfo".len() * 8) + 32;
 const STEALTH_SIGNATURE_BYTES: usize = "stealth_pnginfo".len();
+
+struct StealthBitCursor<'a> {
+    decoded: &'a [u8],
+    height: usize,
+    available_rows: usize,
+    row_bytes: usize,
+    row_stride: usize,
+    bytes_per_pixel: usize,
+    bytes_per_sample: usize,
+    channel_count: usize,
+    bit_capacity: usize,
+    bits_read: usize,
+    x: usize,
+    y: usize,
+    channel_idx: usize,
+    row_start: usize,
+    sample_offset: usize,
+    pixel_sample_start: usize,
+    sample_index: usize,
+}
+
+impl<'a> StealthBitCursor<'a> {
+    fn new(
+        decoded: &'a [u8],
+        width: usize,
+        height: usize,
+        available_rows: usize,
+        row_bytes: usize,
+        bytes_per_pixel: usize,
+        bytes_per_sample: usize,
+        sample_channel: Option<usize>,
+    ) -> Option<Self> {
+        let row_stride = row_bytes.checked_add(1)?;
+        let available_size = row_stride.checked_mul(available_rows)?;
+        // The caller supplies only fully reconstructed rows. Full expansion verifies exact size
+        // before constructing this cursor; the incremental path must pass its completed-row count.
+        let decoded = decoded.get(..available_size)?;
+        let sample_offset = usize::from(bytes_per_sample == 2);
+        let channel_count = if sample_channel.is_some() { 1 } else { 3 };
+        let pixel_count = if available_rows == height {
+            width.checked_mul(height)?
+        } else {
+            available_rows
+        };
+        let bit_capacity = pixel_count.checked_mul(channel_count)?;
+        let sample_index = sample_channel.unwrap_or(0).checked_mul(bytes_per_sample)?;
+        if available_rows == 0
+            || width == 0
+            || sample_index.checked_add(sample_offset)? >= row_bytes
+        {
+            return None;
+        }
+
+        Some(Self {
+            decoded,
+            height,
+            available_rows,
+            row_bytes,
+            row_stride,
+            bytes_per_pixel,
+            bytes_per_sample,
+            channel_count,
+            bit_capacity,
+            bits_read: 0,
+            x: 0,
+            y: 0,
+            channel_idx: 0,
+            row_start: 0,
+            sample_offset,
+            pixel_sample_start: sample_index,
+            sample_index,
+        })
+    }
+
+    fn next_bit(&mut self) -> Option<u8> {
+        if self.bits_read >= self.bit_capacity || self.y >= self.available_rows {
+            return None;
+        }
+        // Row boundaries are validated at cursor creation and when advancing rows; keep the hot
+        // path to one indexed LSB read per bit. In 16-bit samples sample_offset is byte two.
+        let value = self.decoded[self.row_start + 1 + self.sample_index + self.sample_offset] & 1;
+        self.bits_read += 1;
+
+        if self.bits_read < self.bit_capacity {
+            if self.channel_count == 1 {
+                self.advance_pixel()?;
+            } else {
+                self.channel_idx += 1;
+                self.sample_index += self.bytes_per_sample;
+                if self.channel_idx == 3 {
+                    self.channel_idx = 0;
+                    self.sample_index = self.pixel_sample_start;
+                    self.advance_pixel()?;
+                }
+            }
+        }
+        Some(value)
+    }
+
+    fn advance_pixel(&mut self) -> Option<()> {
+        self.y += 1;
+        if self.y == self.height {
+            self.y = 0;
+            self.x = self.x.checked_add(1)?;
+            self.row_start = 0;
+            self.pixel_sample_start = self.pixel_sample_start.checked_add(self.bytes_per_pixel)?;
+            self.sample_index = self.pixel_sample_start;
+        } else {
+            self.row_start = self.row_start.checked_add(self.row_stride)?;
+        }
+        // Each reconstructed row has one filter byte followed by row_bytes sample bytes.
+        if self.y < self.available_rows {
+            self.decoded
+                .get(self.row_start + 1..self.row_start + 1 + self.row_bytes)?;
+        }
+        Some(())
+    }
+
+    fn next_byte(&mut self) -> Option<u8> {
+        let mut byte = 0u8;
+        for bit_in_byte in 0..8 {
+            byte |= self.next_bit()? << (7 - bit_in_byte);
+        }
+        Some(byte)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum StealthPolicy {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl StealthPolicy {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "always" => Some(Self::Always),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
+}
+
+fn has_stealth_header(
+    decoded: &[u8],
+    width: usize,
+    height: usize,
+    available_rows: usize,
+    row_bytes: usize,
+    bytes_per_pixel: usize,
+    bytes_per_sample: usize,
+    color_type: u8,
+) -> Option<bool> {
+    let total_pixels = width.checked_mul(height)?;
+    for mode in ["Alpha", "RGB"] {
+        let sample_channel = match (mode, color_type) {
+            ("Alpha", 4) => Some(1usize),
+            ("Alpha", 6) => Some(3usize),
+            ("RGB", 2 | 6) => None,
+            _ => continue,
+        };
+        let Some(mut bit_cursor) = StealthBitCursor::new(
+            decoded,
+            width,
+            height,
+            available_rows,
+            row_bytes,
+            bytes_per_pixel,
+            bytes_per_sample,
+            sample_channel,
+        ) else {
+            continue;
+        };
+        if bit_cursor.bit_capacity < STEALTH_HEADER_BITS {
+            continue;
+        }
+
+        let mut header = [0u8; STEALTH_SIGNATURE_BYTES + 4];
+        let mut complete = true;
+        for byte in &mut header {
+            if let Some(value) = bit_cursor.next_byte() {
+                *byte = value;
+            } else {
+                complete = false;
+                break;
+            }
+        }
+        if !complete {
+            continue;
+        }
+
+        let signature_bytes = &header[..STEALTH_SIGNATURE_BYTES];
+        let signature_info = if signature_bytes == b"stealth_pnginfo" {
+            Some(("stealth_pnginfo", "Alpha", false))
+        } else if signature_bytes == b"stealth_pngcomp" {
+            Some(("stealth_pngcomp", "Alpha", true))
+        } else if signature_bytes == b"stealth_rgbinfo" {
+            Some(("stealth_rgbinfo", "RGB", false))
+        } else if signature_bytes == b"stealth_rgbcomp" {
+            Some(("stealth_rgbcomp", "RGB", true))
+        } else {
+            None
+        };
+        let Some((_, signature_mode, _)) = signature_info else {
+            continue;
+        };
+        if signature_mode != mode {
+            continue;
+        }
+        let bit_length =
+            u32::from_be_bytes(header[STEALTH_SIGNATURE_BYTES..].try_into().ok()?) as usize;
+        if bit_length % 8 != 0 {
+            continue;
+        }
+        let channel_bits = total_pixels.checked_mul(if mode == "Alpha" { 1 } else { 3 })?;
+        if bit_length / 8 > MAX_STEALTH_PAYLOAD_BYTES
+            || STEALTH_HEADER_BITS.checked_add(bit_length)? > channel_bits
+        {
+            continue;
+        }
+        return Some(true);
+    }
+    Some(false)
+}
 
 struct PngIdatReader<'a> {
     chunks: Vec<&'a [u8]>,
@@ -155,102 +407,87 @@ fn check_stealth_png(png: &[u8]) -> Option<(String, String, String)> {
     let bytes_per_sample = if bit_depth == 16 { 2usize } else { 1usize };
     let bytes_per_pixel = channel_count.checked_mul(bytes_per_sample)?;
     let row_bytes = width.checked_mul(bytes_per_pixel)?;
-    let decoded_size = row_bytes.checked_add(1)?.checked_mul(height)?;
+    let row_stride = row_bytes.checked_add(1)?;
+    let decoded_size = row_stride.checked_mul(height)?;
     if decoded_size > MAX_STEALTH_DECODED_PNG_BYTES {
         return None;
     }
 
-    let mut decoded = Vec::with_capacity(decoded_size);
+    let header_rows = if matches!(color_type, 4 | 6) {
+        STEALTH_HEADER_BITS
+    } else {
+        STEALTH_HEADER_BITS.checked_add(2)? / 3
+    };
+    let prefix_rows = height.min(header_rows);
+    let prefix_size = row_stride.checked_mul(prefix_rows)?;
     let mut decoder =
         ZlibDecoder::new(PngIdatReader::new(idat_chunks)).take(decoded_size as u64 + 1);
-    decoder.read_to_end(&mut decoded).ok()?;
-    if decoded.len() != decoded_size {
+    let mut decoded = vec![0; prefix_size];
+    decoder.read_exact(&mut decoded).ok()?;
+
+    // Only complete rows enter the buffer and can be observed by the bit cursor.
+    for y in 0..prefix_rows {
+        unfilter_png_row(&mut decoded, y, row_bytes, bytes_per_pixel)?;
+    }
+    if !has_stealth_header(
+        &decoded,
+        width,
+        height,
+        prefix_rows,
+        row_bytes,
+        bytes_per_pixel,
+        bytes_per_sample,
+        color_type,
+    )? {
         return None;
     }
 
-    // PNGフィルターを行単位で解除する。各行をインプレースで復元するため、
-    // 画像全体の追加コピーを作らない。
-    for y in 0..height {
-        let row_start = y.checked_mul(row_bytes.checked_add(1)?)?;
-        let previous_start = if y == 0 {
-            None
-        } else {
-            Some(row_start - row_bytes)
-        };
-        let filter = *decoded.get(row_start)?;
-        if filter > 4 {
-            return None;
-        }
-        for x in 0..row_bytes {
-            let index = row_start + 1 + x;
-            let raw = decoded[index];
-            let left = if x >= bytes_per_pixel {
-                decoded[index - bytes_per_pixel]
-            } else {
-                0
-            };
-            let above = previous_start.map(|start| decoded[start + x]).unwrap_or(0);
-            let upper_left = if x >= bytes_per_pixel {
-                previous_start
-                    .map(|start| decoded[start + x - bytes_per_pixel])
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-            decoded[index] = match filter {
-                0 => raw,
-                1 => raw.wrapping_add(left),
-                2 => raw.wrapping_add(above),
-                3 => raw.wrapping_add(((left as u16 + above as u16) / 2) as u8),
-                4 => raw.wrapping_add(paeth_predictor(left, above, upper_left)),
-                _ => unreachable!(),
-            };
-        }
+    // A matching header justifies finishing the same stream; the already unfiltered prefix stays
+    // in place and only the remaining complete rows are appended and restored.
+    for y in prefix_rows..height {
+        let row_end = decoded.len().checked_add(row_stride)?;
+        let previous_len = decoded.len();
+        decoded.resize(row_end, 0);
+        decoder
+            .read_exact(decoded.get_mut(previous_len..row_end)?)
+            .ok()?;
+        unfilter_png_row(&mut decoded, y, row_bytes, bytes_per_pixel)?;
+    }
+    if decoded.len() != decoded_size {
+        return None;
+    }
+    let mut extra = [0u8; 1];
+    if decoder.read(&mut extra).ok()? != 0 {
+        return None;
     }
 
-    let total_pixels = width.checked_mul(height)?;
     for mode in ["Alpha", "RGB"] {
-        let mode_channels = match (mode, color_type) {
-            ("Alpha", 4) => vec![1usize],
-            ("Alpha", 6) => vec![3usize],
-            ("RGB", 2 | 6) => vec![0usize, 1usize, 2usize],
+        let sample_channel = match (mode, color_type) {
+            ("Alpha", 4) => Some(1usize),
+            ("Alpha", 6) => Some(3usize),
+            ("RGB", 2 | 6) => None,
             _ => continue,
         };
-        let channel_bits = total_pixels.checked_mul(mode_channels.len())?;
+        let Some(mut bit_cursor) = StealthBitCursor::new(
+            &decoded,
+            width,
+            height,
+            height,
+            row_bytes,
+            bytes_per_pixel,
+            bytes_per_sample,
+            sample_channel,
+        ) else {
+            return None;
+        };
+        let channel_bits = bit_cursor.bit_capacity;
         if channel_bits < STEALTH_HEADER_BITS {
             continue;
         }
 
-        let read_stream_byte = |byte_index: usize| -> Option<u8> {
-            let mut result = 0u8;
-            for bit_in_byte in 0..8 {
-                let bit_index = byte_index.checked_mul(8)?.checked_add(bit_in_byte)?;
-                if bit_index >= channel_bits {
-                    return None;
-                }
-                let (pixel_index, channel) = if mode == "Alpha" {
-                    (bit_index, mode_channels[0])
-                } else {
-                    (bit_index / 3, mode_channels[bit_index % 3])
-                };
-                // 拡張機能と同じ列優先の座標: pixelIndex = x * height + y。
-                let x = pixel_index / height;
-                let y = pixel_index % height;
-                let row_start = y.checked_mul(row_bytes.checked_add(1)?)?;
-                let sample_offset = if bit_depth == 16 { 1 } else { 0 };
-                let sample_index = x
-                    .checked_mul(bytes_per_pixel)?
-                    .checked_add(channel.checked_mul(bytes_per_sample)?)?
-                    .checked_add(sample_offset)?;
-                let value = *decoded.get(row_start.checked_add(1)?.checked_add(sample_index)?)? & 1;
-                result |= value << (7 - bit_in_byte);
-            }
-            Some(result)
-        };
-
         let mut header = [0u8; STEALTH_SIGNATURE_BYTES + 4];
-        for (index, byte) in header.iter_mut().enumerate() {
-            *byte = read_stream_byte(index)?;
+        for byte in &mut header {
+            *byte = bit_cursor.next_byte()?;
         }
         let signature_bytes = &header[..STEALTH_SIGNATURE_BYTES];
         let (signature, signature_mode, compressed) = if signature_bytes == b"stealth_pnginfo" {
@@ -279,8 +516,8 @@ fn check_stealth_png(png: &[u8]) -> Option<(String, String, String)> {
             continue;
         }
         let mut payload = Vec::with_capacity(payload_len);
-        for index in 0..payload_len {
-            payload.push(read_stream_byte(header.len().checked_add(index)?)?);
+        for _ in 0..payload_len {
+            payload.push(bit_cursor.next_byte()?);
         }
         let text_bytes = if compressed {
             let Some(output) = inflate_stealth_payload(&payload) else {
@@ -326,6 +563,82 @@ fn paeth_predictor(left: u8, above: u8, upper_left: u8) -> u8 {
     } else {
         upper_left as u8
     }
+}
+
+fn unfilter_png_row(
+    decoded: &mut [u8],
+    y: usize,
+    row_bytes: usize,
+    bytes_per_pixel: usize,
+) -> Option<()> {
+    let row_stride = row_bytes.checked_add(1)?;
+    let row_start = y.checked_mul(row_stride)?;
+    let (before_row, current_with_filter) = decoded.split_at_mut(row_start);
+    let (filter, current_row_and_rest) = current_with_filter.split_first_mut()?;
+    let current_row = current_row_and_rest.get_mut(..row_bytes)?;
+    let previous_row = if y == 0 {
+        None
+    } else {
+        let previous_start = row_start.checked_sub(row_stride)?.checked_add(1)?;
+        let previous_end = previous_start.checked_add(row_bytes)?;
+        Some(before_row.get(previous_start..previous_end)?)
+    };
+
+    match *filter {
+        0 => {}
+        1 => {
+            for x in bytes_per_pixel..row_bytes {
+                let left = current_row[x - bytes_per_pixel];
+                current_row[x] = current_row[x].wrapping_add(left);
+            }
+        }
+        2 => {
+            if let Some(above) = previous_row {
+                for x in 0..row_bytes {
+                    current_row[x] = current_row[x].wrapping_add(above[x]);
+                }
+            }
+        }
+        3 => match previous_row {
+            None => {
+                for x in bytes_per_pixel..row_bytes {
+                    let left = current_row[x - bytes_per_pixel];
+                    current_row[x] = current_row[x].wrapping_add(left / 2);
+                }
+            }
+            Some(above) => {
+                for x in 0..bytes_per_pixel {
+                    current_row[x] = current_row[x].wrapping_add(above[x] / 2);
+                }
+                for x in bytes_per_pixel..row_bytes {
+                    let left = current_row[x - bytes_per_pixel];
+                    let average = ((left as u16 + above[x] as u16) / 2) as u8;
+                    current_row[x] = current_row[x].wrapping_add(average);
+                }
+            }
+        },
+        4 => match previous_row {
+            None => {
+                for x in bytes_per_pixel..row_bytes {
+                    let left = current_row[x - bytes_per_pixel];
+                    current_row[x] = current_row[x].wrapping_add(left);
+                }
+            }
+            Some(above) => {
+                for x in 0..bytes_per_pixel {
+                    current_row[x] = current_row[x].wrapping_add(above[x]);
+                }
+                for x in bytes_per_pixel..row_bytes {
+                    let left = current_row[x - bytes_per_pixel];
+                    let upper_left = above[x - bytes_per_pixel];
+                    current_row[x] =
+                        current_row[x].wrapping_add(paeth_predictor(left, above[x], upper_left));
+                }
+            }
+        },
+        _ => return None,
+    }
+    Some(())
 }
 
 fn extract_webp_metadata(mmap: &[u8], path: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -415,12 +728,16 @@ fn extract_exif_metadata(
     Ok(())
 }
 
-fn extract_universal_metadata(path: &str, strict: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn extract_universal_metadata(
+    path: &str,
+    strict: bool,
+    stealth_policy: StealthPolicy,
+) -> Result<(), Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let mmap = unsafe { MmapOptions::new().map(&file)? };
 
     if mmap.len() >= 8 && &mmap[0..8] == &[137, 80, 78, 71, 13, 10, 26, 10] {
-        return extract_png_metadata(&mmap, path, strict);
+        return extract_png_metadata(&mmap, path, strict, stealth_policy);
     }
     if mmap.len() >= 12 && &mmap[0..4] == b"RIFF" && &mmap[8..12] == b"WEBP" {
         return extract_webp_metadata(&mmap, path);
@@ -436,22 +753,43 @@ fn extract_universal_metadata(path: &str, strict: bool) -> Result<(), Box<dyn st
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut strict = false;
+    let mut stealth_policy = StealthPolicy::Auto;
     let mut image_path = None;
-    for argument in args.iter().skip(1) {
-        if argument == "--strict" {
-            strict = true;
-        } else if argument.starts_with("--") || image_path.is_some() {
-            eprintln!("Usage: {} [--strict] <image_file>", args[0]);
-            std::process::exit(1);
-        } else {
-            image_path = Some(argument.as_str());
+    let mut arguments = args.iter().skip(1);
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--strict" => strict = true,
+            "--stealth" => {
+                let Some(value) = arguments
+                    .next()
+                    .and_then(|value| StealthPolicy::parse(value))
+                else {
+                    eprintln!(
+                        "Usage: {} [--strict] [--stealth <auto|always|never>] <image_file>",
+                        args[0]
+                    );
+                    std::process::exit(1);
+                };
+                stealth_policy = value;
+            }
+            _ if argument.starts_with("--") || image_path.is_some() => {
+                eprintln!(
+                    "Usage: {} [--strict] [--stealth <auto|always|never>] <image_file>",
+                    args[0]
+                );
+                std::process::exit(1);
+            }
+            _ => image_path = Some(argument.as_str()),
         }
     }
     let Some(image_path) = image_path else {
-        eprintln!("Usage: {} [--strict] <image_file>", args[0]);
+        eprintln!(
+            "Usage: {} [--strict] [--stealth <auto|always|never>] <image_file>",
+            args[0]
+        );
         std::process::exit(1);
     };
-    if let Err(e) = extract_universal_metadata(image_path, strict) {
+    if let Err(e) = extract_universal_metadata(image_path, strict, stealth_policy) {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
