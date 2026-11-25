@@ -314,7 +314,7 @@ pub fn parse_packet<'a>(bytes: &'a [u8], source: Source) -> ParsedPacket<'a> {
 }
 
 fn draw_things_json(text: &str) -> Option<String> {
-    if !text.starts_with('{') {
+    if !text.trim_start().starts_with('{') {
         return None;
     }
     let value: Value = serde_json::from_str(text).ok()?;
@@ -932,6 +932,18 @@ mod tests {
         assert!(parsed.records[0]
             .body
             .ends_with("{\n  \"c\": \"cat\",\n  \"uc\": \"bad\"\n}"));
+    }
+
+    #[test]
+    fn draw_things_json_accepts_leading_whitespace_and_suppresses_description() {
+        let packet = rdf(
+            "<rdf:Description xmlns:d='http://purl.org/dc/elements/1.1/' xmlns:e='http://ns.adobe.com/exif/1.0/'><d:description>duplicate prompt</d:description><e:UserComment> \n\t{&quot;c&quot;:&quot;cat&quot;}</e:UserComment></rdf:Description>",
+        );
+        let parsed = parse_packet(packet.as_bytes(), Source::PngXmp);
+
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.records[0].label, "Draw Things (XMP)");
+        assert!(parsed.records[0].body.starts_with("Prompt: cat\nJSON:\n"));
     }
 
     #[test]
