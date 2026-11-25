@@ -337,44 +337,9 @@ fn check_stealth_png(png: &[u8]) -> Option<(String, String, String)> {
         return None;
     }
 
-    // PNGフィルターを行単位で解除する。各行をインプレースで復元するため、
-    // 画像全体の追加コピーを作らない。
+    // Full expansion verified the complete decoded size; restore each row in place.
     for y in 0..height {
-        let row_start = y.checked_mul(row_bytes.checked_add(1)?)?;
-        let previous_start = if y == 0 {
-            None
-        } else {
-            Some(row_start - row_bytes)
-        };
-        let filter = *decoded.get(row_start)?;
-        if filter > 4 {
-            return None;
-        }
-        for x in 0..row_bytes {
-            let index = row_start + 1 + x;
-            let raw = decoded[index];
-            let left = if x >= bytes_per_pixel {
-                decoded[index - bytes_per_pixel]
-            } else {
-                0
-            };
-            let above = previous_start.map(|start| decoded[start + x]).unwrap_or(0);
-            let upper_left = if x >= bytes_per_pixel {
-                previous_start
-                    .map(|start| decoded[start + x - bytes_per_pixel])
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-            decoded[index] = match filter {
-                0 => raw,
-                1 => raw.wrapping_add(left),
-                2 => raw.wrapping_add(above),
-                3 => raw.wrapping_add(((left as u16 + above as u16) / 2) as u8),
-                4 => raw.wrapping_add(paeth_predictor(left, above, upper_left)),
-                _ => unreachable!(),
-            };
-        }
+        unfilter_png_row(&mut decoded, y, row_bytes, bytes_per_pixel)?;
     }
 
     for mode in ["Alpha", "RGB"] {
@@ -479,6 +444,82 @@ fn paeth_predictor(left: u8, above: u8, upper_left: u8) -> u8 {
     } else {
         upper_left as u8
     }
+}
+
+fn unfilter_png_row(
+    decoded: &mut [u8],
+    y: usize,
+    row_bytes: usize,
+    bytes_per_pixel: usize,
+) -> Option<()> {
+    let row_stride = row_bytes.checked_add(1)?;
+    let row_start = y.checked_mul(row_stride)?;
+    let (before_row, current_with_filter) = decoded.split_at_mut(row_start);
+    let (filter, current_row_and_rest) = current_with_filter.split_first_mut()?;
+    let current_row = current_row_and_rest.get_mut(..row_bytes)?;
+    let previous_row = if y == 0 {
+        None
+    } else {
+        let previous_start = row_start.checked_sub(row_stride)?.checked_add(1)?;
+        let previous_end = previous_start.checked_add(row_bytes)?;
+        Some(before_row.get(previous_start..previous_end)?)
+    };
+
+    match *filter {
+        0 => {}
+        1 => {
+            for x in bytes_per_pixel..row_bytes {
+                let left = current_row[x - bytes_per_pixel];
+                current_row[x] = current_row[x].wrapping_add(left);
+            }
+        }
+        2 => {
+            if let Some(above) = previous_row {
+                for x in 0..row_bytes {
+                    current_row[x] = current_row[x].wrapping_add(above[x]);
+                }
+            }
+        }
+        3 => match previous_row {
+            None => {
+                for x in bytes_per_pixel..row_bytes {
+                    let left = current_row[x - bytes_per_pixel];
+                    current_row[x] = current_row[x].wrapping_add(left / 2);
+                }
+            }
+            Some(above) => {
+                for x in 0..bytes_per_pixel {
+                    current_row[x] = current_row[x].wrapping_add(above[x] / 2);
+                }
+                for x in bytes_per_pixel..row_bytes {
+                    let left = current_row[x - bytes_per_pixel];
+                    let average = ((left as u16 + above[x] as u16) / 2) as u8;
+                    current_row[x] = current_row[x].wrapping_add(average);
+                }
+            }
+        },
+        4 => match previous_row {
+            None => {
+                for x in bytes_per_pixel..row_bytes {
+                    let left = current_row[x - bytes_per_pixel];
+                    current_row[x] = current_row[x].wrapping_add(left);
+                }
+            }
+            Some(above) => {
+                for x in 0..bytes_per_pixel {
+                    current_row[x] = current_row[x].wrapping_add(above[x]);
+                }
+                for x in bytes_per_pixel..row_bytes {
+                    let left = current_row[x - bytes_per_pixel];
+                    let upper_left = above[x - bytes_per_pixel];
+                    current_row[x] =
+                        current_row[x].wrapping_add(paeth_predictor(left, above[x], upper_left));
+                }
+            }
+        },
+        _ => return None,
+    }
+    Some(())
 }
 
 fn extract_webp_metadata(mmap: &[u8], path: &str) -> Result<(), Box<dyn std::error::Error>> {

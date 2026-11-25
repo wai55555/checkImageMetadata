@@ -47,6 +47,20 @@ fn compress(data: &[u8]) -> Vec<u8> {
     encoder.finish().expect("finish fixture IDAT")
 }
 
+fn paeth_predictor(left: u8, above: u8, upper_left: u8) -> u8 {
+    let predictor = left as i32 + above as i32 - upper_left as i32;
+    let left_distance = (predictor - left as i32).abs();
+    let above_distance = (predictor - above as i32).abs();
+    let upper_left_distance = (predictor - upper_left as i32).abs();
+    if left_distance <= above_distance && left_distance <= upper_left_distance {
+        left
+    } else if above_distance <= upper_left_distance {
+        above
+    } else {
+        upper_left
+    }
+}
+
 fn stealth_png(payload: &[u8], text_chunk: Option<Vec<u8>>) -> Vec<u8> {
     stealth_png_variant(payload, "stealth_pnginfo", 8, false, false, text_chunk)
 }
@@ -92,6 +106,40 @@ fn stealth_png_variant(
             x * 4 * bytes_per_sample + channel_idx * bytes_per_sample + sample_offset;
         raw[y * row_stride + 1 + sample_index] |= bit;
     }
+    let bytes_per_pixel = 4 * bytes_per_sample;
+    let mut filtered = vec![0; raw.len()];
+    for y in 0..height {
+        let row_start = y * row_stride;
+        let filter = (y % 5) as u8;
+        filtered[row_start] = filter;
+        for x in 0..row_bytes {
+            let value = raw[row_start + 1 + x];
+            let left = if x >= bytes_per_pixel {
+                raw[row_start + 1 + x - bytes_per_pixel]
+            } else {
+                0
+            };
+            let above = if y == 0 {
+                0
+            } else {
+                raw[row_start - row_stride + 1 + x]
+            };
+            let upper_left = if y == 0 || x < bytes_per_pixel {
+                0
+            } else {
+                raw[row_start - row_stride + 1 + x - bytes_per_pixel]
+            };
+            let predictor = match filter {
+                0 => 0,
+                1 => left,
+                2 => above,
+                3 => ((left as u16 + above as u16) / 2) as u8,
+                4 => paeth_predictor(left, above, upper_left),
+                _ => unreachable!(),
+            };
+            filtered[row_start + 1 + x] = value.wrapping_sub(predictor);
+        }
+    }
 
     let mut png = PNG_SIGNATURE.to_vec();
     let mut ihdr = Vec::with_capacity(13);
@@ -102,7 +150,7 @@ fn stealth_png_variant(
     if let Some(chunk) = text_chunk {
         png.extend_from_slice(&chunk);
     }
-    png.extend_from_slice(&png_chunk(b"IDAT", &compress(&raw)));
+    png.extend_from_slice(&png_chunk(b"IDAT", &compress(&filtered)));
     png.extend_from_slice(&png_chunk(b"IEND", &[]));
     png
 }
@@ -135,6 +183,14 @@ fn fixture_11_stealth_only_is_found_by_default_auto_policy() {
     assert!(output.contains("--- Stealth PNG Info (Alpha) [stealth_pnginfo] ---"));
     assert!(output.contains("fixture 11 payload"));
     assert!(!output.contains("(No metadata detected)"));
+}
+
+#[test]
+fn stealth_scan_restores_rows_using_each_png_filter() {
+    let png = TempPng::new(&stealth_png(b"filters 0 through 4", None));
+    let output = run_cli(&[png.path.to_str().unwrap()]);
+
+    assert!(output.contains("filters 0 through 4"));
 }
 
 #[test]
