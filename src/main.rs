@@ -9,7 +9,6 @@ use flate2::read::{GzDecoder, ZlibDecoder};
 use memmap2::MmapOptions;
 use std::fs::File;
 use std::io::{self, Read};
-use std::str;
 
 fn extract_png_metadata(
     mmap: &[u8],
@@ -330,25 +329,49 @@ fn paeth_predictor(left: u8, above: u8, upper_left: u8) -> u8 {
 
 fn extract_webp_metadata(mmap: &[u8], path: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== WebP File: {} ===", path);
-    let mut cursor = 12;
+    let mut cursor = 12usize;
     let len = mmap.len();
     let mut found = false;
 
-    while cursor + 8 <= len {
-        let chunk_type = &mmap[cursor..cursor + 4];
-        let chunk_size = u32::from_le_bytes(mmap[cursor + 4..cursor + 8].try_into()?) as usize;
-        let data_start = cursor + 8;
-        if data_start + chunk_size > len {
+    while let Some(header_end) = cursor.checked_add(8) {
+        if header_end > len {
+            break;
+        }
+        let Some(chunk_type_end) = cursor.checked_add(4) else {
+            break;
+        };
+        let Some(chunk_type) = mmap.get(cursor..chunk_type_end) else {
+            break;
+        };
+        let Some(size_bytes) = mmap.get(chunk_type_end..header_end) else {
+            break;
+        };
+        let Ok(size_bytes) = <[u8; 4]>::try_from(size_bytes) else {
+            break;
+        };
+        let chunk_size = u32::from_le_bytes(size_bytes) as usize;
+        let data_start = header_end;
+        let Some(data_end) = data_start.checked_add(chunk_size) else {
+            break;
+        };
+        if data_end > len {
             break;
         }
 
         if chunk_type == b"EXIF" {
-            let exif_data = &mmap[data_start..data_start + chunk_size];
-            extract_from_exif(exif_data)?;
-            found = true;
+            let exif_data = &mmap[data_start..data_end];
+            let records = tiff::parse(exif_data, record::Source::WebpExif);
+            if !records.is_empty() {
+                let mut sink = output::TextSink::default();
+                for record in records {
+                    sink.push_record(record);
+                }
+                sink.flush(&mut io::stdout().lock())?;
+                found = true;
+            }
         } else if chunk_type == b"XMP " {
-            let xmp_data = &mmap[data_start..data_start + chunk_size];
-            if let Ok(xmp_str) = str::from_utf8(xmp_data) {
+            let xmp_data = &mmap[data_start..data_end];
+            if let Ok(xmp_str) = std::str::from_utf8(xmp_data) {
                 // XMLから簡易的に parameters 属性を抽出
                 if let Some(start) = xmp_str.find("parameters=\"") {
                     let rest = &xmp_str[start + 12..];
@@ -364,57 +387,14 @@ fn extract_webp_metadata(mmap: &[u8], path: &str) -> Result<(), Box<dyn std::err
             }
         }
 
-        cursor = data_start + chunk_size;
-        if chunk_size % 2 == 1 {
-            cursor += 1;
-        }
+        let Some(next_cursor) = data_end.checked_add(chunk_size % 2) else {
+            break;
+        };
+        cursor = next_cursor;
     }
 
     if !found {
         println!("(No metadata detected)");
-    }
-    Ok(())
-}
-
-fn extract_from_exif(exif_data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    // 既存のEXIF解析ロジック
-    let (charset, text_data) = if exif_data.len() >= 12 && &exif_data[0..4] == b"\0\0\0\0" {
-        (&exif_data[4..12], &exif_data[12..])
-    } else if exif_data.len() >= 8 {
-        (&exif_data[0..8], &exif_data[8..])
-    } else {
-        return Ok(());
-    };
-
-    if charset.starts_with(b"UNICODE") {
-        if text_data.len() >= 2 {
-            let is_le =
-                text_data[0..2] == [0xFF, 0xFE] || (text_data[1] == 0 && text_data[0] >= 0x20);
-            let utf16_data: Vec<u16> = text_data
-                .chunks_exact(2)
-                .take(10000)
-                .map(|c| {
-                    if is_le {
-                        u16::from_le_bytes([c[0], c[1]])
-                    } else {
-                        u16::from_be_bytes([c[0], c[1]])
-                    }
-                })
-                .take_while(|&c| c != 0 && c != 0xFEFF)
-                .collect();
-            if let Ok(text) = String::from_utf16(&utf16_data) {
-                println!("--- EXIF UserComment (UNICODE) ---");
-                println!("{}", text);
-            }
-        }
-    } else if charset.starts_with(b"ASCII") || charset.iter().all(|&b| b == 0) {
-        if let Ok(text) = str::from_utf8(text_data) {
-            let trimmed = text.trim_end_matches('\0');
-            if !trimmed.is_empty() {
-                println!("--- EXIF UserComment ---");
-                println!("{}", trimmed);
-            }
-        }
     }
     Ok(())
 }
