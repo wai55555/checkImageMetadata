@@ -164,10 +164,20 @@ pub fn scan<'a>(bytes: &'a [u8], strict: bool) -> PngScan<'a> {
         }
     }
 
+    let retained_chain_records = if resolved {
+        Vec::new()
+    } else {
+        chain_progress
+            .as_ref()
+            .map(|progress| progress.partial_records(bytes))
+            .unwrap_or_default()
+    };
+
     if !resolved {
         if let Some(walk) = fast_walk(bytes, first_idat, iend) {
             stats.stage_c_step = Some(3);
-            post_idat = walk.records;
+            post_idat = retained_chain_records.clone();
+            post_idat.extend(walk.records);
             stats.iend_offset = walk.iend_offset.or(stats.iend_offset);
             resolved = true;
         }
@@ -176,7 +186,8 @@ pub fn scan<'a>(bytes: &'a [u8], strict: bool) -> PngScan<'a> {
     if !resolved {
         let fallback = full_post_idat_walk(bytes, first_idat);
         stats.stage_c_step = Some(4);
-        post_idat = fallback.records;
+        post_idat = retained_chain_records;
+        post_idat.extend(fallback.records);
         stats.iend_offset = fallback.iend_offset.or(stats.iend_offset);
     }
 
@@ -567,6 +578,17 @@ impl ChainProgress {
             collect_chunk_records(bytes, chunk, &mut records);
         }
         Some(Chain { records })
+    }
+
+    fn partial_records<'a>(&self, bytes: &'a [u8]) -> Vec<LocatedRecord<'a>> {
+        let mut chunks = self.reversed_chunks.clone();
+        chunks.reverse();
+        let mut records = Vec::new();
+        for chunk in chunks {
+            collect_chunk_records(bytes, chunk, &mut records);
+        }
+        records.sort_by_key(|entry| entry.offset);
+        records
     }
 }
 
@@ -1199,6 +1221,22 @@ mod tests {
             ["found"]
         );
         assert_eq!(result.stats.stage_c_step, Some(1));
+    }
+
+    #[test]
+    fn stage_b_partial_records_are_available_for_later_escalation() {
+        let idat = chunk(b"IDAT", &[1], true);
+        let profile = chunk(b"iCCP", &vec![0x35; 160 * 1024], true);
+        let workflow = text(b"workflow", b"retained");
+        let image = png(&[idat, profile, workflow]);
+        let first_idat = 33;
+        let iend = image.len() - 12;
+        let progress = reverse_chain(&image, first_idat, iend, INITIAL_WINDOW);
+
+        assert!(!progress.reached_idat);
+        let records = progress.partial_records(&image);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].record.body, "retained");
     }
 
     #[test]
