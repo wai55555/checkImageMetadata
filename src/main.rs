@@ -1,153 +1,45 @@
-pub mod output;
 pub mod keywords;
+pub mod output;
+pub mod png;
 pub mod record;
 
+use flate2::read::{GzDecoder, ZlibDecoder};
 use memmap2::MmapOptions;
 use std::fs::File;
 use std::io::{self, Read};
 use std::str;
-use serde_json::Value;
-use flate2::read::{GzDecoder, ZlibDecoder};
 
-// 最初のスキャン上限 (64KB)
+// JPEG EXIF marker search bound; PNG now uses the chunk walker.
 const FAST_SCAN_LIMIT: usize = 65536;
 
-fn extract_png_metadata(mmap: &[u8], path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let len = mmap.len();
-    let mut cursor = 8;
-    let mut found_metadata = false;
-    let mut is_comfy_style = false;
-    let mut is_first_chunk_after_ihdr = true;
-
+fn extract_png_metadata(
+    mmap: &[u8],
+    path: &str,
+    strict: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::output::TextSink;
+    let result = png::scan(mmap, strict);
     println!("=== PNG File: {} ===", path);
-
-    // 最初に FAST_SCAN_LIMIT (64KB) まで走査
-    let scan_limit = mmap.len().min(FAST_SCAN_LIMIT);
-    
-    while cursor + 8 < scan_limit {
-        let chunk_len = u32::from_be_bytes(mmap[cursor..cursor+4].try_into()?) as usize;
-        let chunk_type = &mmap[cursor+4..cursor+8];
-        let data_start = cursor + 8;
-        let next_chunk = data_start + chunk_len + 4;
-
-        // 次のチャンクが 64KB を超える場合でも、iTXt/tEXt なら読みに行く必要がある
-        // それ以外の巨大データ (IDAT等) は飛ばす
-        
-        // ComfyUI 指紋判定: IHDRの直後のチャンクが IDAT で 65536バイト
-        if chunk_type != b"IHDR" {
-            if is_first_chunk_after_ihdr {
-                if chunk_type == b"IDAT" && chunk_len == 65536 {
-                    is_comfy_style = true;
-                }
-                is_first_chunk_after_ihdr = false;
-            }
-        }
-
-        if chunk_type == b"tEXt" || chunk_type == b"iTXt" {
-            // チャンクデータがファイル全体の範囲内か確認
-            if next_chunk <= len {
-                let data = &mmap[data_start..data_start + chunk_len];
-                if parse_png_chunk(chunk_type, data)? {
-                    found_metadata = true;
-                }
-            }
-        }
-
-        cursor = next_chunk;
-        if chunk_type == b"IEND" { break; }
-    }
-
-    // 64KBで見つからず、ComfyUIスタイル（末尾にデータがある可能性）の場合は末尾をスキャン
-    if (!found_metadata || is_comfy_style) && len > FAST_SCAN_LIMIT {
-        // 末尾 128KB をスキャン
-        let tail_size = 131072.min(len - FAST_SCAN_LIMIT);
-        let tail_start = len - tail_size;
-        
+    if result.stats.comfy_tail_notice {
         println!("(Large file or ComfyUI detected. Scanning tail for metadata...)");
-        
-        // 末尾から tEXt / iTXt を探す (簡易スキャン)
-        let mut tail_cursor = tail_start;
-        while tail_cursor + 8 < len {
-            // "tEXt" または "iTXt" という文字列をバイト列から探す
-            if &mmap[tail_cursor+4..tail_cursor+8] == b"tEXt" || &mmap[tail_cursor+4..tail_cursor+8] == b"iTXt" {
-                let chunk_len = u32::from_be_bytes(mmap[tail_cursor..tail_cursor+4].try_into()?) as usize;
-                let chunk_type = &mmap[tail_cursor+4..tail_cursor+8];
-                let data_start = tail_cursor + 8;
-                if data_start + chunk_len <= len {
-                    let data = &mmap[data_start..data_start + chunk_len];
-                    if parse_png_chunk(chunk_type, data)? {
-                        found_metadata = true;
-                    }
-                }
-            }
-            tail_cursor += 1; // 1バイトずつずらして検索 (効率は落ちるが確実)
-        }
     }
+    let has_metadata = !result.records.is_empty();
+    let mut sink = TextSink::default();
+    for record in result.records {
+        sink.push_record(record);
+    }
+    sink.flush(&mut io::stdout().lock())?;
 
-    // 通常のPNGメタデータに加えて Stealth PNG も走査する
-    if !found_metadata {
+    if !has_metadata {
         if let Some((mode, signature, stealth_meta)) = check_stealth_png(mmap) {
             println!("--- Stealth PNG Info ({}) [{}] ---", mode, signature);
             println!("{}", stealth_meta);
-            found_metadata = true;
+            return Ok(());
         }
-    }
-
-    if !found_metadata {
         println!("(No metadata detected)");
     }
 
     Ok(())
-}
-
-fn parse_png_chunk(chunk_type: &[u8], data: &[u8]) -> Result<bool, Box<dyn std::error::Error>> {
-    let mut meta_found = false;
-    if chunk_type == b"tEXt" {
-        if let Some(null_pos) = data.iter().position(|&b| b == 0) {
-            if let Some(keyword) = keywords::lookup(&data[..null_pos]) {
-                if !keyword.xmp_packet {
-                    let text = str::from_utf8(&data[null_pos + 1..]).unwrap_or("");
-                    print_metadata(keyword.name, text)?;
-                    meta_found = true;
-                }
-            }
-        }
-    } else if chunk_type == b"iTXt" {
-        if let Some(null_pos) = data.iter().position(|&b| b == 0) {
-            if let Some(keyword) = keywords::lookup(&data[..null_pos]) {
-                if !keyword.xmp_packet {
-                    if null_pos + 2 < data.len() {
-                        let comp_flag = data[null_pos + 1];
-                        // ヌル終端の lang_tag と trans_key を飛ばす
-                        let rest = &data[null_pos + 3..];
-                        if let Some(lang_end) = rest.iter().position(|&b| b == 0) {
-                            let rest2 = &rest[lang_end + 1..];
-                            if let Some(trans_end) = rest2.iter().position(|&b| b == 0) {
-                                let text_bytes = &rest2[trans_end + 1..];
-                                
-                                if comp_flag == 1 {
-                                    // 圧縮データの解凍
-                                    let mut decoder = ZlibDecoder::new(text_bytes);
-                                    let mut decoded_text = String::new();
-                                    if decoder.read_to_string(&mut decoded_text).is_ok() {
-                                        print_metadata(keyword.name, &decoded_text)?;
-                                        meta_found = true;
-                                    }
-                                } else {
-                                    // 非圧縮
-                                    if let Ok(text) = str::from_utf8(text_bytes) {
-                                        print_metadata(keyword.name, text)?;
-                                        meta_found = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(meta_found)
 }
 
 const MAX_STEALTH_DIMENSION: usize = 16_384;
@@ -165,7 +57,11 @@ struct PngIdatReader<'a> {
 
 impl<'a> PngIdatReader<'a> {
     fn new(chunks: Vec<&'a [u8]>) -> Self {
-        Self { chunks, chunk_index: 0, chunk_offset: 0 }
+        Self {
+            chunks,
+            chunk_index: 0,
+            chunk_offset: 0,
+        }
     }
 }
 
@@ -204,9 +100,15 @@ fn check_stealth_png(png: &[u8]) -> Option<(String, String, String)> {
     let bit_depth = ihdr[8];
     let color_type = ihdr[9];
     // 拡張機能のステルススキャナーが対応する非インターレース配置に限定する。
-    if width == 0 || height == 0 || width > MAX_STEALTH_DIMENSION ||
-        height > MAX_STEALTH_DIMENSION || ihdr[10] != 0 || ihdr[11] != 0 || ihdr[12] != 0 ||
-        !matches!((color_type, bit_depth), (2 | 4 | 6, 8 | 16)) {
+    if width == 0
+        || height == 0
+        || width > MAX_STEALTH_DIMENSION
+        || height > MAX_STEALTH_DIMENSION
+        || ihdr[10] != 0
+        || ihdr[11] != 0
+        || ihdr[12] != 0
+        || !matches!((color_type, bit_depth), (2 | 4 | 6, 8 | 16))
+    {
         return None;
     }
 
@@ -260,8 +162,8 @@ fn check_stealth_png(png: &[u8]) -> Option<(String, String, String)> {
     }
 
     let mut decoded = Vec::with_capacity(decoded_size);
-    let mut decoder = ZlibDecoder::new(PngIdatReader::new(idat_chunks))
-        .take(decoded_size as u64 + 1);
+    let mut decoder =
+        ZlibDecoder::new(PngIdatReader::new(idat_chunks)).take(decoded_size as u64 + 1);
     decoder.read_to_end(&mut decoded).ok()?;
     if decoded.len() != decoded_size {
         return None;
@@ -271,7 +173,11 @@ fn check_stealth_png(png: &[u8]) -> Option<(String, String, String)> {
     // 画像全体の追加コピーを作らない。
     for y in 0..height {
         let row_start = y.checked_mul(row_bytes.checked_add(1)?)?;
-        let previous_start = if y == 0 { None } else { Some(row_start - row_bytes) };
+        let previous_start = if y == 0 {
+            None
+        } else {
+            Some(row_start - row_bytes)
+        };
         let filter = *decoded.get(row_start)?;
         if filter > 4 {
             return None;
@@ -279,10 +185,16 @@ fn check_stealth_png(png: &[u8]) -> Option<(String, String, String)> {
         for x in 0..row_bytes {
             let index = row_start + 1 + x;
             let raw = decoded[index];
-            let left = if x >= bytes_per_pixel { decoded[index - bytes_per_pixel] } else { 0 };
+            let left = if x >= bytes_per_pixel {
+                decoded[index - bytes_per_pixel]
+            } else {
+                0
+            };
             let above = previous_start.map(|start| decoded[start + x]).unwrap_or(0);
             let upper_left = if x >= bytes_per_pixel {
-                previous_start.map(|start| decoded[start + x - bytes_per_pixel]).unwrap_or(0)
+                previous_start
+                    .map(|start| decoded[start + x - bytes_per_pixel])
+                    .unwrap_or(0)
             } else {
                 0
             };
@@ -327,7 +239,8 @@ fn check_stealth_png(png: &[u8]) -> Option<(String, String, String)> {
                 let y = pixel_index % height;
                 let row_start = y.checked_mul(row_bytes.checked_add(1)?)?;
                 let sample_offset = if bit_depth == 16 { 1 } else { 0 };
-                let sample_index = x.checked_mul(bytes_per_pixel)?
+                let sample_index = x
+                    .checked_mul(bytes_per_pixel)?
                     .checked_add(channel.checked_mul(bytes_per_sample)?)?
                     .checked_add(sample_offset)?;
                 let value = *decoded.get(row_start.checked_add(1)?.checked_add(sample_index)?)? & 1;
@@ -355,13 +268,15 @@ fn check_stealth_png(png: &[u8]) -> Option<(String, String, String)> {
         if signature_mode != mode {
             continue;
         }
-        let bit_length = u32::from_be_bytes(header[STEALTH_SIGNATURE_BYTES..].try_into().ok()?) as usize;
+        let bit_length =
+            u32::from_be_bytes(header[STEALTH_SIGNATURE_BYTES..].try_into().ok()?) as usize;
         if bit_length % 8 != 0 {
             continue;
         }
         let payload_len = bit_length / 8;
-        if payload_len > MAX_STEALTH_PAYLOAD_BYTES ||
-            STEALTH_HEADER_BITS.checked_add(bit_length)? > channel_bits {
+        if payload_len > MAX_STEALTH_PAYLOAD_BYTES
+            || STEALTH_HEADER_BITS.checked_add(bit_length)? > channel_bits
+        {
             continue;
         }
         let mut payload = Vec::with_capacity(payload_len);
@@ -421,10 +336,12 @@ fn extract_webp_metadata(mmap: &[u8], path: &str) -> Result<(), Box<dyn std::err
     let mut found = false;
 
     while cursor + 8 <= len {
-        let chunk_type = &mmap[cursor..cursor+4];
-        let chunk_size = u32::from_le_bytes(mmap[cursor+4..cursor+8].try_into()?) as usize;
+        let chunk_type = &mmap[cursor..cursor + 4];
+        let chunk_size = u32::from_le_bytes(mmap[cursor + 4..cursor + 8].try_into()?) as usize;
         let data_start = cursor + 8;
-        if data_start + chunk_size > len { break; }
+        if data_start + chunk_size > len {
+            break;
+        }
 
         if chunk_type == b"EXIF" {
             let exif_data = &mmap[data_start..data_start + chunk_size];
@@ -449,29 +366,13 @@ fn extract_webp_metadata(mmap: &[u8], path: &str) -> Result<(), Box<dyn std::err
         }
 
         cursor = data_start + chunk_size;
-        if chunk_size % 2 == 1 { cursor += 1; }
-    }
-    
-    if !found { println!("(No metadata detected)"); }
-    Ok(())
-}
-
-fn print_metadata(keyword: &str, text: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(definition) = keywords::lookup(keyword.as_bytes()) else {
-        return Ok(());
-    };
-    if definition.xmp_packet {
-        return Ok(());
-    }
-    println!("--- {} ---", definition.label);
-    if definition.json_settings {
-        if let Ok(value) = serde_json::from_str::<Value>(text) {
-            println!("{}", serde_json::to_string_pretty(&value)?);
-        } else {
-            println!("{}", text);
+        if chunk_size % 2 == 1 {
+            cursor += 1;
         }
-    } else {
-        println!("{}", text);
+    }
+
+    if !found {
+        println!("(No metadata detected)");
     }
     Ok(())
 }
@@ -485,13 +386,23 @@ fn extract_from_exif(exif_data: &[u8]) -> Result<(), Box<dyn std::error::Error>>
     } else {
         return Ok(());
     };
-        
+
     if charset.starts_with(b"UNICODE") {
         if text_data.len() >= 2 {
-            let is_le = text_data[0..2] == [0xFF, 0xFE] || (text_data[1] == 0 && text_data[0] >= 0x20);
-            let utf16_data: Vec<u16> = text_data.chunks_exact(2).take(10000).map(|c| {
-                if is_le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) }
-            }).take_while(|&c| c != 0 && c != 0xFEFF).collect();
+            let is_le =
+                text_data[0..2] == [0xFF, 0xFE] || (text_data[1] == 0 && text_data[0] >= 0x20);
+            let utf16_data: Vec<u16> = text_data
+                .chunks_exact(2)
+                .take(10000)
+                .map(|c| {
+                    if is_le {
+                        u16::from_le_bytes([c[0], c[1]])
+                    } else {
+                        u16::from_be_bytes([c[0], c[1]])
+                    }
+                })
+                .take_while(|&c| c != 0 && c != 0xFEFF)
+                .collect();
             if let Ok(text) = String::from_utf16(&utf16_data) {
                 println!("--- EXIF UserComment (UNICODE) ---");
                 println!("{}", text);
@@ -509,27 +420,34 @@ fn extract_from_exif(exif_data: &[u8]) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-fn extract_exif_metadata(mmap: &[u8], path: &str, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn extract_exif_metadata(
+    mmap: &[u8],
+    path: &str,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== {} File: {} ===", format, path);
-    
+
     // "Exif\0\0" を探す
     let search_len = mmap.len().min(FAST_SCAN_LIMIT);
     let mut tiff_start = 0;
     for i in 0..search_len.saturating_sub(10) {
-        if &mmap[i..i+6] == b"Exif\0\0" {
+        if &mmap[i..i + 6] == b"Exif\0\0" {
             tiff_start = i + 6;
             break;
         }
     }
-    if tiff_start == 0 { println!("(No EXIF marker found)"); return Ok(()); }
+    if tiff_start == 0 {
+        println!("(No EXIF marker found)");
+        return Ok(());
+    }
 
     // UserComment 0x9286 を探す (簡易)
     let tag_id = [0x86, 0x92];
     for i in tiff_start..search_len.saturating_sub(12) {
-        if mmap[i] == tag_id[0] && mmap[i+1] == tag_id[1] {
+        if mmap[i] == tag_id[0] && mmap[i + 1] == tag_id[1] {
             // データオフセットと長さを取得 (LE前提)
-            let data_len = u32::from_le_bytes(mmap[i+4..i+8].try_into()?) as usize;
-            let offset_val = u32::from_le_bytes(mmap[i+8..i+12].try_into()?) as usize;
+            let data_len = u32::from_le_bytes(mmap[i + 4..i + 8].try_into()?) as usize;
+            let offset_val = u32::from_le_bytes(mmap[i + 8..i + 12].try_into()?) as usize;
             let data_offset = tiff_start + offset_val;
             if data_offset + data_len <= mmap.len() && data_len >= 8 {
                 extract_from_exif(&mmap[data_offset..data_offset + data_len])?;
@@ -541,12 +459,12 @@ fn extract_exif_metadata(mmap: &[u8], path: &str, format: &str) -> Result<(), Bo
     Ok(())
 }
 
-fn extract_universal_metadata(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn extract_universal_metadata(path: &str, strict: bool) -> Result<(), Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let mmap = unsafe { MmapOptions::new().map(&file)? };
 
     if mmap.len() >= 8 && &mmap[0..8] == &[137, 80, 78, 71, 13, 10, 26, 10] {
-        return extract_png_metadata(&mmap, path);
+        return extract_png_metadata(&mmap, path, strict);
     }
     if mmap.len() >= 12 && &mmap[0..4] == b"RIFF" && &mmap[8..12] == b"WEBP" {
         return extract_webp_metadata(&mmap, path);
@@ -554,18 +472,30 @@ fn extract_universal_metadata(path: &str) -> Result<(), Box<dyn std::error::Erro
     if mmap.len() >= 3 && &mmap[0..3] == &[0xFF, 0xD8, 0xFF] {
         return extract_exif_metadata(&mmap, path, "JPEG");
     }
-    
+
     eprintln!("Unsupported file format");
     Ok(())
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <image_file>", args[0]);
-        std::process::exit(1);
+    let mut strict = false;
+    let mut image_path = None;
+    for argument in args.iter().skip(1) {
+        if argument == "--strict" {
+            strict = true;
+        } else if argument.starts_with("--") || image_path.is_some() {
+            eprintln!("Usage: {} [--strict] <image_file>", args[0]);
+            std::process::exit(1);
+        } else {
+            image_path = Some(argument.as_str());
+        }
     }
-    if let Err(e) = extract_universal_metadata(&args[1]) {
+    let Some(image_path) = image_path else {
+        eprintln!("Usage: {} [--strict] <image_file>", args[0]);
+        std::process::exit(1);
+    };
+    if let Err(e) = extract_universal_metadata(image_path, strict) {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
