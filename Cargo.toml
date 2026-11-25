@@ -1,12 +1,21 @@
 [package]
 name = "fast_meta"
-version = "1.2.0"
+version = "2.0.0"
 edition = "2021"
 
 [dependencies]
 memmap2 = "0.9"
 serde_json = "1.0"
-kamadak-exif = "0.5"
-flate2 = "1.0"
-image = "0.24"
-pocket-resources = "0.3" # For embedded icons/resources if needed
+flate2 = { version = "1.0", default-features = false }
+crc32fast = "1.5"
+memchr = "2.7"
+
+[features]
+default = ["zlib-ng"]
+zlib-ng = ["flate2/zlib-ng"]
+portable-zlib = ["flate2/rust_backend"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
