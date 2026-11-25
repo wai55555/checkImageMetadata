@@ -15,6 +15,7 @@ fn extract_png_metadata(
     mmap: &[u8],
     path: &str,
     strict: bool,
+    stealth_policy: StealthPolicy,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::output::TextSink;
     let result = png::scan(mmap, strict);
@@ -22,19 +23,42 @@ fn extract_png_metadata(
     if result.stats.comfy_tail_notice {
         println!("(Large file or ComfyUI detected. Scanning tail for metadata...)");
     }
-    let has_metadata = !result.records.is_empty();
+    let has_normal_metadata = result.records.iter().any(|record| {
+        matches!(
+            record.source,
+            record::Source::PngText
+                | record::Source::PngExif
+                | record::Source::PngXmp
+                | record::Source::JpegExif
+                | record::Source::JpegXmp
+                | record::Source::JpegComment
+                | record::Source::JpegIptc
+                | record::Source::WebpExif
+                | record::Source::WebpXmp
+                | record::Source::TiffXmp
+        )
+    });
+    let stealth_result = match stealth_policy {
+        StealthPolicy::Never => None,
+        StealthPolicy::Auto if has_normal_metadata => None,
+        StealthPolicy::Auto | StealthPolicy::Always => check_stealth_png(mmap),
+    };
     let mut sink = TextSink::default();
     for record in result.records {
         sink.push_record(record);
     }
+    if let Some((mode, signature, body)) = stealth_result.as_ref() {
+        sink.push_record(record::RecordView {
+            source: record::Source::PngStealth,
+            label: std::borrow::Cow::Owned(format!("Stealth PNG Info ({mode}) [{signature}]")),
+            body: std::borrow::Cow::Owned(body.clone()),
+            keyword: None,
+            detail: Some(std::borrow::Cow::Owned(format!("{mode}/{signature}"))),
+        });
+    }
     sink.flush(&mut io::stdout().lock())?;
 
-    if !has_metadata {
-        if let Some((mode, signature, stealth_meta)) = check_stealth_png(mmap) {
-            println!("--- Stealth PNG Info ({}) [{}] ---", mode, signature);
-            println!("{}", stealth_meta);
-            return Ok(());
-        }
+    if !has_normal_metadata && stealth_result.is_none() {
         println!("(No metadata detected)");
     }
 
@@ -47,6 +71,25 @@ const MAX_STEALTH_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STEALTH_IDAT_BYTES: usize = 512 * 1024 * 1024;
 const STEALTH_HEADER_BITS: usize = ("stealth_pnginfo".len() * 8) + 32;
 const STEALTH_SIGNATURE_BYTES: usize = "stealth_pnginfo".len();
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum StealthPolicy {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl StealthPolicy {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "always" => Some(Self::Always),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
+}
 
 struct PngIdatReader<'a> {
     chunks: Vec<&'a [u8]>,
@@ -415,12 +458,16 @@ fn extract_exif_metadata(
     Ok(())
 }
 
-fn extract_universal_metadata(path: &str, strict: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn extract_universal_metadata(
+    path: &str,
+    strict: bool,
+    stealth_policy: StealthPolicy,
+) -> Result<(), Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let mmap = unsafe { MmapOptions::new().map(&file)? };
 
     if mmap.len() >= 8 && &mmap[0..8] == &[137, 80, 78, 71, 13, 10, 26, 10] {
-        return extract_png_metadata(&mmap, path, strict);
+        return extract_png_metadata(&mmap, path, strict, stealth_policy);
     }
     if mmap.len() >= 12 && &mmap[0..4] == b"RIFF" && &mmap[8..12] == b"WEBP" {
         return extract_webp_metadata(&mmap, path);
@@ -436,22 +483,43 @@ fn extract_universal_metadata(path: &str, strict: bool) -> Result<(), Box<dyn st
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut strict = false;
+    let mut stealth_policy = StealthPolicy::Auto;
     let mut image_path = None;
-    for argument in args.iter().skip(1) {
-        if argument == "--strict" {
-            strict = true;
-        } else if argument.starts_with("--") || image_path.is_some() {
-            eprintln!("Usage: {} [--strict] <image_file>", args[0]);
-            std::process::exit(1);
-        } else {
-            image_path = Some(argument.as_str());
+    let mut arguments = args.iter().skip(1);
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--strict" => strict = true,
+            "--stealth" => {
+                let Some(value) = arguments
+                    .next()
+                    .and_then(|value| StealthPolicy::parse(value))
+                else {
+                    eprintln!(
+                        "Usage: {} [--strict] [--stealth <auto|always|never>] <image_file>",
+                        args[0]
+                    );
+                    std::process::exit(1);
+                };
+                stealth_policy = value;
+            }
+            _ if argument.starts_with("--") || image_path.is_some() => {
+                eprintln!(
+                    "Usage: {} [--strict] [--stealth <auto|always|never>] <image_file>",
+                    args[0]
+                );
+                std::process::exit(1);
+            }
+            _ => image_path = Some(argument.as_str()),
         }
     }
     let Some(image_path) = image_path else {
-        eprintln!("Usage: {} [--strict] <image_file>", args[0]);
+        eprintln!(
+            "Usage: {} [--strict] [--stealth <auto|always|never>] <image_file>",
+            args[0]
+        );
         std::process::exit(1);
     };
-    if let Err(e) = extract_universal_metadata(image_path, strict) {
+    if let Err(e) = extract_universal_metadata(image_path, strict, stealth_policy) {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
