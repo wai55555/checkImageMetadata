@@ -393,7 +393,7 @@ fn decode_text<'a>(bytes: &'a [u8]) -> Option<Cow<'a, str>> {
     }
     Some(match std::str::from_utf8(bytes) {
         Ok(text) => Cow::Borrowed(text),
-        Err(_) => Cow::Owned(bytes.iter().map(|&byte| char::from(byte)).collect()),
+        Err(_) => Cow::Owned(decode_latin1(bytes)?),
     })
 }
 
@@ -406,8 +406,20 @@ fn decode_text_owned(bytes: Vec<u8>) -> Option<Cow<'static, str>> {
     }
     Some(match String::from_utf8(bytes) {
         Ok(text) => Cow::Owned(text),
-        Err(error) => Cow::Owned(error.into_bytes().into_iter().map(char::from).collect()),
+        Err(error) => Cow::Owned(decode_latin1(&error.into_bytes())?),
     })
+}
+
+fn decode_latin1(bytes: &[u8]) -> Option<String> {
+    // Latin-1 bytes can each require up to two UTF-8 bytes. Reserve the full
+    // checked upper bound fallibly, without imposing a text-size limit.
+    let capacity = bytes.len().checked_mul(2)?;
+    let mut decoded = String::new();
+    decoded.try_reserve_exact(capacity).ok()?;
+    for &byte in bytes {
+        decoded.push(char::from(byte));
+    }
+    Some(decoded)
 }
 
 fn decode_utf16(bytes: &[u8], little_endian: bool) -> Option<String> {
@@ -1123,6 +1135,14 @@ mod tests {
         let utf16 = text(b"workflow", &[0xff, 0xfe, b'h', 0, b'i', 0]);
         let result = bodies(&png(&[utf8, latin1, utf16]), false);
         assert_eq!(result, ["日本語", "café", "hi"]);
+    }
+
+    #[test]
+    fn latin1_fallback_uses_fallible_allocation_and_preserves_bytes() {
+        let bytes: Vec<u8> = (0x80..=0xff).collect();
+        let decoded = decode_latin1(&bytes).unwrap();
+        let expected: String = bytes.iter().map(|&byte| char::from(byte)).collect();
+        assert_eq!(decoded, expected);
     }
 
     #[test]
