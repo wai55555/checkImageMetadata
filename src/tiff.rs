@@ -186,7 +186,7 @@ fn parse_ifd<'a>(
         let entry = reader.entry(ifd.entries_start, index)?;
         if entry.tag == USER_COMMENT {
             if let Some(data) = reader.value(entry) {
-                if let Some(body) = decode_initial_user_comment(data) {
+                if let Some(body) = decode_user_comment(data) {
                     records.push(RecordView {
                         source,
                         label: Cow::Borrowed("EXIF UserComment"),
@@ -223,22 +223,133 @@ fn parse_ifd<'a>(
     Some(ifd.next_ifd)
 }
 
-fn decode_initial_user_comment(data: &[u8]) -> Option<Cow<'_, str>> {
-    let body = if data.len() >= 8 {
-        let code = data.get(..8)?;
+fn decode_user_comment(data: &[u8]) -> Option<Cow<'_, str>> {
+    let (body, encoding) = if let Some(code) = data.get(..8) {
+        let body = data.get(8..)?;
         if code == b"ASCII\0\0\0" || code == b"JIS\0\0\0\0\0" {
-            data.get(8..)?
+            (body, UserCommentEncoding::Text)
+        } else if code == b"UNICODE\0" {
+            (body, UserCommentEncoding::Unicode)
+        } else if code == [0; 8] {
+            (body, UserCommentEncoding::Undefined)
         } else {
-            data
+            (data, UserCommentEncoding::Text)
         }
     } else {
-        data
+        (data, UserCommentEncoding::Text)
     };
-    let text = std::str::from_utf8(body).ok()?.trim_end_matches('\0');
-    if text.is_empty() {
+
+    let decoded = match encoding {
+        UserCommentEncoding::Text => decode_utf8_or_latin1(body)?,
+        UserCommentEncoding::Unicode => Cow::Owned(decode_unicode(body)),
+        UserCommentEncoding::Undefined => decode_undefined_code(body)?,
+    };
+    let decoded = match decoded {
+        Cow::Borrowed(text) => Cow::Borrowed(text.trim_end_matches('\0')),
+        Cow::Owned(text) => Cow::Owned(trim_trailing_nuls(text)),
+    };
+    if decoded.is_empty() {
         return None;
     }
-    Some(Cow::Borrowed(text))
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&decoded) {
+        if let Ok(pretty) = serde_json::to_string_pretty(&value) {
+            return Some(Cow::Owned(pretty));
+        }
+    }
+    Some(decoded)
+}
+
+#[derive(Clone, Copy)]
+enum UserCommentEncoding {
+    Text,
+    Unicode,
+    Undefined,
+}
+
+#[derive(Clone, Copy)]
+enum Utf16Order {
+    Little,
+    Big,
+}
+
+fn decode_unicode(bytes: &[u8]) -> String {
+    if let Some((order, body)) = utf16_bom(bytes) {
+        return decode_utf16_order(body, order);
+    }
+    // D-09 adds content scoring for BOM-less UNICODE values; BE is a safe
+    // temporary default so this D-08 change remains independently buildable.
+    decode_utf16_order(bytes, Utf16Order::Big)
+}
+
+fn decode_undefined_code(bytes: &[u8]) -> Option<Cow<'_, str>> {
+    if let Some((order, body)) = utf16_bom(bytes) {
+        return Some(Cow::Owned(decode_utf16_order(body, order)));
+    }
+    let (even_zeroes, odd_zeroes) =
+        bytes
+            .iter()
+            .enumerate()
+            .fold((0usize, 0usize), |(even, odd), (index, byte)| {
+                if *byte == 0 {
+                    if index % 2 == 0 {
+                        (even + 1, odd)
+                    } else {
+                        (even, odd + 1)
+                    }
+                } else {
+                    (even, odd)
+                }
+            });
+    if even_zeroes > odd_zeroes {
+        Some(Cow::Owned(decode_utf16_order(bytes, Utf16Order::Big)))
+    } else if odd_zeroes > even_zeroes {
+        Some(Cow::Owned(decode_utf16_order(bytes, Utf16Order::Little)))
+    } else {
+        decode_utf8_or_latin1(bytes)
+    }
+}
+
+fn utf16_bom(bytes: &[u8]) -> Option<(Utf16Order, &[u8])> {
+    match bytes.get(..2)? {
+        [0xff, 0xfe] => Some((Utf16Order::Little, bytes.get(2..)?)),
+        [0xfe, 0xff] => Some((Utf16Order::Big, bytes.get(2..)?)),
+        _ => None,
+    }
+}
+
+fn decode_utf16_order(bytes: &[u8], order: Utf16Order) -> String {
+    let mut units = Vec::with_capacity(bytes.len().div_ceil(2));
+    for pair in bytes.chunks_exact(2) {
+        let pair = [pair[0], pair[1]];
+        units.push(match order {
+            Utf16Order::Little => u16::from_le_bytes(pair),
+            Utf16Order::Big => u16::from_be_bytes(pair),
+        });
+    }
+    let mut text = String::from_utf16_lossy(&units);
+    if bytes.len() % 2 != 0 {
+        text.push('\u{fffd}');
+    }
+    text
+}
+
+fn decode_utf8_or_latin1(bytes: &[u8]) -> Option<Cow<'_, str>> {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return Some(Cow::Borrowed(text));
+    }
+    let mut text = String::new();
+    text.try_reserve_exact(bytes.len()).ok()?;
+    for byte in bytes {
+        text.push(char::from(*byte));
+    }
+    Some(Cow::Owned(text))
+}
+
+fn trim_trailing_nuls(mut text: String) -> String {
+    while text.ends_with('\0') {
+        text.pop();
+    }
+    text
 }
 
 #[cfg(test)]
@@ -253,6 +364,23 @@ mod tests {
         bytes.extend_from_slice(&count.to_le_bytes());
         bytes.extend_from_slice(&value);
         bytes
+    }
+
+    fn tiff_with_comment(comment: &[u8]) -> Vec<u8> {
+        let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        let mut value = [0u8; 4];
+        if comment.len() <= value.len() {
+            value[..comment.len()].copy_from_slice(comment);
+        } else {
+            value = 26u32.to_le_bytes();
+        }
+        tiff.extend_from_slice(&entry(0x9286, 7, comment.len() as u32, value));
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        if comment.len() > 4 {
+            tiff.extend_from_slice(comment);
+        }
+        tiff
     }
 
     #[test]
@@ -319,5 +447,33 @@ mod tests {
         let records = parse(&tiff, Source::JpegExif);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].body, "once");
+    }
+
+    #[test]
+    fn fixture_17_decodes_undefined_charset_utf16le_without_dropping_prefix() {
+        let expected = "parameters=1\nSteps: 4";
+        let mut comment = vec![0; 8];
+        for unit in expected.encode_utf16() {
+            comment.extend_from_slice(&unit.to_le_bytes());
+        }
+        let tiff = tiff_with_comment(&comment);
+        let records = parse(&tiff, Source::JpegExif);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].body, expected);
+    }
+
+    #[test]
+    fn user_comment_keeps_short_and_unknown_charset_bytes() {
+        let short_bytes = tiff_with_comment(b"abc");
+        let short = parse(&short_bytes, Source::JpegExif);
+        assert_eq!(short[0].body, "abc");
+
+        let unknown_bytes = tiff_with_comment(b"12345678");
+        let unknown = parse(&unknown_bytes, Source::JpegExif);
+        assert_eq!(unknown[0].body, "12345678");
+
+        let latin1 = tiff_with_comment(b"ASCII\0\0\0\xe9");
+        let decoded = parse(&latin1, Source::JpegExif);
+        assert_eq!(decoded[0].body, "é");
     }
 }
