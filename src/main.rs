@@ -4,6 +4,7 @@ pub mod output;
 pub mod png;
 pub mod record;
 pub mod tiff;
+pub mod xmp;
 
 use flate2::read::{GzDecoder, ZlibDecoder};
 use memmap2::MmapOptions;

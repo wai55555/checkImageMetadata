@@ -299,11 +299,23 @@ fn collect_chunk_records<'a>(bytes: &'a [u8], chunk: Chunk, output: &mut Vec<Loc
             chunk.offset,
             set_text_detail(parse_ztxt(data), "zTXt"),
         ),
-        k if k == kind(b"iTXt") => append_record(
-            output,
-            chunk.offset,
-            set_text_detail(parse_itxt(data), "iTXt"),
-        ),
+        k if k == kind(b"iTXt") => match parse_itxt(data) {
+            ItxtRecords::Text(record) => {
+                append_record(output, chunk.offset, set_text_detail(record, "iTXt"))
+            }
+            ItxtRecords::Xmp(records) => {
+                output.extend(
+                    records
+                        .into_iter()
+                        .enumerate()
+                        .map(|(record_index, record)| LocatedRecord {
+                            offset: chunk.offset,
+                            record_index,
+                            record,
+                        }),
+                );
+            }
+        },
         k if k == kind(b"eXIf") => {
             output.extend(
                 tiff::parse(data, Source::PngExif)
@@ -390,36 +402,95 @@ fn parse_ztxt(data: &[u8]) -> Option<RecordView<'static>> {
     text_record(&data[..split], Cow::Owned(decoded))
 }
 
-fn parse_itxt<'a>(data: &'a [u8]) -> Option<RecordView<'a>> {
-    let key_end = data.iter().position(|&byte| byte == 0)?;
-    let flag = *data.get(key_end.checked_add(1)?)?;
-    let method = *data.get(key_end.checked_add(2)?)?;
+enum ItxtRecords<'a> {
+    Text(Option<RecordView<'a>>),
+    Xmp(Vec<RecordView<'a>>),
+}
+
+fn parse_itxt<'a>(data: &'a [u8]) -> ItxtRecords<'a> {
+    let Some(key_end) = data.iter().position(|&byte| byte == 0) else {
+        return ItxtRecords::Text(None);
+    };
+    let Some(flag) = key_end
+        .checked_add(1)
+        .and_then(|index| data.get(index))
+        .copied()
+    else {
+        return ItxtRecords::Text(None);
+    };
+    let Some(method) = key_end
+        .checked_add(2)
+        .and_then(|index| data.get(index))
+        .copied()
+    else {
+        return ItxtRecords::Text(None);
+    };
     if method != 0 || flag > 1 {
-        return None;
+        return ItxtRecords::Text(None);
     }
-    let after_fields = key_end.checked_add(3)?;
-    let lang_end_rel = data
-        .get(after_fields..)?
-        .iter()
-        .position(|&byte| byte == 0)?;
-    let translated_start = after_fields.checked_add(lang_end_rel)?.checked_add(1)?;
-    let translated_end_rel = data
-        .get(translated_start..)?
-        .iter()
-        .position(|&byte| byte == 0)?;
-    let text_start = translated_start
-        .checked_add(translated_end_rel)?
-        .checked_add(1)?;
-    let text_bytes = data.get(text_start..)?;
+    let Some(after_fields) = key_end.checked_add(3) else {
+        return ItxtRecords::Text(None);
+    };
+    let Some(lang_end_rel) = data
+        .get(after_fields..)
+        .and_then(|bytes| bytes.iter().position(|&byte| byte == 0))
+    else {
+        return ItxtRecords::Text(None);
+    };
+    let Some(translated_start) = after_fields
+        .checked_add(lang_end_rel)
+        .and_then(|offset| offset.checked_add(1))
+    else {
+        return ItxtRecords::Text(None);
+    };
+    let Some(translated_end_rel) = data
+        .get(translated_start..)
+        .and_then(|bytes| bytes.iter().position(|&byte| byte == 0))
+    else {
+        return ItxtRecords::Text(None);
+    };
+    let Some(text_start) = translated_start
+        .checked_add(translated_end_rel)
+        .and_then(|offset| offset.checked_add(1))
+    else {
+        return ItxtRecords::Text(None);
+    };
+    let Some(text_bytes) = data.get(text_start..) else {
+        return ItxtRecords::Text(None);
+    };
+
+    let is_xmp = keywords::lookup(&data[..key_end]).is_some_and(|keyword| keyword.xmp_packet);
+    if is_xmp {
+        let records = if flag == 1 {
+            let Some(decoded) = decompress_text(text_bytes) else {
+                return ItxtRecords::Xmp(Vec::new());
+            };
+            if std::str::from_utf8(&decoded).is_err() {
+                return ItxtRecords::Xmp(Vec::new());
+            }
+            crate::xmp::parse_owned(decoded, Source::PngXmp)
+        } else if std::str::from_utf8(text_bytes).is_ok() {
+            crate::xmp::parse(text_bytes, Source::PngXmp)
+        } else {
+            Vec::new()
+        };
+        return ItxtRecords::Xmp(records);
+    }
+
     let decoded = if flag == 1 {
-        Cow::Owned(decompress_text(text_bytes)?)
+        let Some(decoded) = decompress_text(text_bytes) else {
+            return ItxtRecords::Text(None);
+        };
+        Cow::Owned(decoded)
     } else {
         Cow::Borrowed(text_bytes)
     };
     // iTXt's text is UTF-8 (compressed or not). Decode using the shared UTF-8 /
     // Latin-1 policy only for non-XMP registered text, after field validation.
-    std::str::from_utf8(decoded.as_ref()).ok()?;
-    text_record(&data[..key_end], decoded)
+    if std::str::from_utf8(decoded.as_ref()).is_err() {
+        return ItxtRecords::Text(None);
+    }
+    ItxtRecords::Text(text_record(&data[..key_end], decoded))
 }
 
 fn decode_text<'a>(bytes: &'a [u8]) -> Option<Cow<'a, str>> {
@@ -1161,6 +1232,22 @@ mod tests {
         chunk(b"tEXt", &data, true)
     }
 
+    fn itxt_xmp(packet: &[u8], compressed: bool) -> Vec<u8> {
+        let mut data = b"XML:com.adobe.xmp\0".to_vec();
+        data.push(u8::from(compressed));
+        data.push(0);
+        data.push(0);
+        data.push(0);
+        if compressed {
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(packet).unwrap();
+            data.extend_from_slice(&encoder.finish().unwrap());
+        } else {
+            data.extend_from_slice(packet);
+        }
+        chunk(b"iTXt", &data, true)
+    }
+
     fn exif_user_comment(comment: &[u8]) -> Vec<u8> {
         let mut value = b"ASCII\0\0\0".to_vec();
         value.extend_from_slice(comment);
@@ -1246,6 +1333,19 @@ mod tests {
         assert_eq!(result.records[0].source, Source::PngExif);
         assert_eq!(result.records[0].label, "EXIF UserComment");
         assert_eq!(result.records[0].body, "parameters=from-png-exif");
+    }
+
+    #[test]
+    fn fixture_8_reads_draw_things_xmp_from_itxt_and_suppresses_description() {
+        let packet = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description xmlns:d='http://purl.org/dc/elements/1.1/' xmlns:e='http://ns.adobe.com/exif/1.0/'><d:description>duplicate prompt</d:description><e:UserComment>{&quot;c&quot;:&quot;a cat&quot;,&quot;uc&quot;:&quot;bad quality&quot;}</e:UserComment></rdf:Description></rdf:RDF></x:xmpmeta>";
+        for compressed in [false, true] {
+            let image = png(&[itxt_xmp(packet, compressed)]);
+            let result = scan(&image, false);
+            assert_eq!(result.records.len(), 1);
+            assert_eq!(result.records[0].source, Source::PngXmp);
+            assert_eq!(result.records[0].label, "Draw Things (XMP)");
+            assert!(result.records[0].body.contains("\"c\": \"a cat\""));
+        }
     }
 
     #[test]

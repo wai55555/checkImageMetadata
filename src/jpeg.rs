@@ -1,8 +1,33 @@
+use std::borrow::Cow;
+
 use crate::record::{RecordView, Source};
 use crate::tiff;
+use crate::xmp;
 
-const EXIF_IDENTIFIER: &[u8; 6] = b"Exif\0\0";
+const EXIF_IDENTIFIER: &[u8] = b"Exif\0\0";
+const XMP_MAIN_IDENTIFIER: &str = "http://ns.adobe.com/xap/1.0/\0";
+const XMP_EXTENSION_IDENTIFIER: &str = "http://ns.adobe.com/xmp/extension/\0";
+const MAX_XMP_BYTES: usize = 16 * 1024 * 1024;
 const SOI: &[u8; 2] = b"\xff\xd8";
+
+struct LocatedRecord<'a> {
+    offset: usize,
+    record_index: usize,
+    record: RecordView<'a>,
+}
+
+struct MainXmp<'a> {
+    offset: usize,
+    packet: &'a [u8],
+}
+
+struct ExtendedFragment<'a> {
+    offset: usize,
+    guid: &'a [u8],
+    total_length: usize,
+    fragment_offset: usize,
+    body: &'a [u8],
+}
 
 #[derive(Default)]
 pub struct JpegScan<'a> {
@@ -16,6 +41,9 @@ pub fn scan<'a>(bytes: &'a [u8]) -> JpegScan<'a> {
     }
 
     let mut result = JpegScan::default();
+    let mut records = Vec::new();
+    let mut main_xmp = Vec::new();
+    let mut extended_fragments = Vec::new();
     let mut pos = 2usize;
     loop {
         let Some(marker_end) = pos.checked_add(2) else {
@@ -83,20 +111,197 @@ pub fn scan<'a>(bytes: &'a [u8]) -> JpegScan<'a> {
         if marker == 0xe1 && payload.starts_with(EXIF_IDENTIFIER) {
             result.saw_exif = true;
             if let Some(tiff_data) = payload.get(EXIF_IDENTIFIER.len()..) {
-                result
-                    .records
-                    .extend(tiff::parse(tiff_data, Source::JpegExif));
+                records.extend(
+                    tiff::parse(tiff_data, Source::JpegExif)
+                        .into_iter()
+                        .enumerate()
+                        .map(|(record_index, record)| LocatedRecord {
+                            offset: pos,
+                            record_index,
+                            record,
+                        }),
+                );
+            }
+        } else if marker == 0xe1 && payload.starts_with(XMP_MAIN_IDENTIFIER.as_bytes()) {
+            if let Some(packet) = payload.get(XMP_MAIN_IDENTIFIER.len()..) {
+                main_xmp.push(MainXmp {
+                    offset: pos,
+                    packet,
+                });
+            }
+        } else if marker == 0xe1 && payload.starts_with(XMP_EXTENSION_IDENTIFIER.as_bytes()) {
+            if let Some(fragment) = parse_extended_fragment(payload, pos) {
+                extended_fragments.push(fragment);
+            }
+        } else if marker == 0xfe {
+            if let Some(record) = jpeg_comment_record(payload) {
+                records.push(LocatedRecord {
+                    offset: pos,
+                    record_index: 0,
+                    record,
+                });
             }
         }
 
         pos = segment_end;
     }
+
+    let main_xmp_present = !main_xmp.is_empty();
+    let mut main_records = Vec::new();
+    let mut extended_guids = Vec::new();
+    for packet in main_xmp {
+        let parsed = xmp::parse_packet(packet.packet, Source::JpegXmp);
+        if let Some(guid) = parsed.has_extended_xmp {
+            if valid_guid(guid.as_bytes()) {
+                extended_guids.push(guid);
+            }
+        }
+        main_records.extend(parsed.records.into_iter().enumerate().map(
+            |(record_index, record)| LocatedRecord {
+                offset: packet.offset,
+                record_index,
+                record,
+            },
+        ));
+    }
+    records.extend(main_records);
+
+    if let Some((packet, offset)) =
+        reassemble_extended_xmp(&extended_fragments, main_xmp_present, &extended_guids)
+    {
+        records.extend(
+            xmp::parse_owned(packet, Source::JpegXmp)
+                .into_iter()
+                .enumerate()
+                .map(|(record_index, record)| LocatedRecord {
+                    offset,
+                    record_index,
+                    record,
+                }),
+        );
+    }
+    records.sort_by_key(|record| (record.offset, record.record_index));
+    result.records = records.into_iter().map(|located| located.record).collect();
     result
+}
+
+fn parse_extended_fragment<'a>(payload: &'a [u8], offset: usize) -> Option<ExtendedFragment<'a>> {
+    // Derive the identifier length from the specification literal itself.
+    let header = payload.strip_prefix(XMP_EXTENSION_IDENTIFIER.as_bytes())?;
+    let guid = header.get(..32)?;
+    if !valid_guid(guid) {
+        return None;
+    }
+    let total_end = 32usize.checked_add(4)?;
+    let fragment_offset_end = total_end.checked_add(4)?;
+    let total_bytes: [u8; 4] = header.get(32..total_end)?.try_into().ok()?;
+    let fragment_offset_bytes: [u8; 4] = header
+        .get(total_end..fragment_offset_end)?
+        .try_into()
+        .ok()?;
+    let total_length = usize::try_from(u32::from_be_bytes(total_bytes)).ok()?;
+    if total_length > MAX_XMP_BYTES {
+        return None;
+    }
+    Some(ExtendedFragment {
+        offset,
+        guid,
+        total_length,
+        fragment_offset: usize::try_from(u32::from_be_bytes(fragment_offset_bytes)).ok()?,
+        body: header.get(fragment_offset_end..)?,
+    })
+}
+
+fn valid_guid(guid: &[u8]) -> bool {
+    guid.len() == 32 && guid.iter().all(u8::is_ascii_hexdigit)
+}
+
+fn reassemble_extended_xmp(
+    fragments: &[ExtendedFragment<'_>],
+    main_has_xmp: bool,
+    main_guids: &[String],
+) -> Option<(Vec<u8>, usize)> {
+    let first = fragments.first()?;
+    if main_has_xmp
+        && !main_guids
+            .iter()
+            .any(|guid| guid.as_bytes().eq_ignore_ascii_case(first.guid))
+    {
+        return None;
+    }
+    if fragments.iter().any(|fragment| {
+        !fragment.guid.eq_ignore_ascii_case(first.guid)
+            || fragment.total_length != first.total_length
+    }) {
+        return None;
+    }
+
+    let total_length = first.total_length;
+    let mut ordered: Vec<_> = fragments.iter().collect();
+    ordered.sort_by_key(|fragment| fragment.fragment_offset);
+    let mut expected_offset = 0usize;
+    let mut previous_offset = None;
+    for fragment in &ordered {
+        let end = fragment.fragment_offset.checked_add(fragment.body.len())?;
+        if end > total_length
+            || previous_offset == Some(fragment.fragment_offset)
+            || fragment.fragment_offset != expected_offset
+        {
+            return None;
+        }
+        previous_offset = Some(fragment.fragment_offset);
+        expected_offset = end;
+    }
+    if expected_offset != total_length {
+        return None;
+    }
+
+    // Allocation occurs only after the advertised size and complete coverage
+    // have been validated.
+    let mut packet = Vec::with_capacity(total_length);
+    for fragment in ordered {
+        packet.extend_from_slice(fragment.body);
+    }
+    Some((packet, first.offset))
+}
+
+fn jpeg_comment_record(payload: &[u8]) -> Option<RecordView<'_>> {
+    let body = match std::str::from_utf8(payload) {
+        Ok(text) => Cow::Borrowed(text),
+        Err(_) => Cow::Owned(payload.iter().map(|&byte| char::from(byte)).collect()),
+    };
+    if body.is_empty() {
+        return None;
+    }
+    let label = if body.contains("Negative prompt:") || body.contains("Steps:") {
+        "Stable Diffusion (A1111)"
+    } else {
+        "JPEG Comment"
+    };
+    Some(RecordView {
+        source: Source::JpegComment,
+        label: Cow::Borrowed(label),
+        body,
+        keyword: None,
+        detail: None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::scan;
+    use crate::output::TextSink;
+    use crate::record::Source;
+
+    const MAIN_XMP_IDENTIFIER: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
+    const EXT_XMP_IDENTIFIER: &[u8] = b"http://ns.adobe.com/xmp/extension/\0";
+
+    fn xmp_packet(description: &str) -> Vec<u8> {
+        format!(
+            "<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>{description}</rdf:RDF></x:xmpmeta>"
+        )
+        .into_bytes()
+    }
 
     fn be_tiff_user_comment(comment: &[u8]) -> Vec<u8> {
         let mut value = b"ASCII\0\0\0".to_vec();
@@ -131,6 +336,21 @@ mod tests {
         output.extend_from_slice(&((data.len() + 2) as u16).to_be_bytes());
         output.extend_from_slice(data);
         output
+    }
+
+    fn main_xmp_segment(packet: &[u8]) -> Vec<u8> {
+        let mut payload = MAIN_XMP_IDENTIFIER.to_vec();
+        payload.extend_from_slice(packet);
+        segment(0xe1, &payload)
+    }
+
+    fn extended_xmp_segment(guid: &[u8], total: usize, offset: usize, body: &[u8]) -> Vec<u8> {
+        let mut payload = EXT_XMP_IDENTIFIER.to_vec();
+        payload.extend_from_slice(guid);
+        payload.extend_from_slice(&(total as u32).to_be_bytes());
+        payload.extend_from_slice(&(offset as u32).to_be_bytes());
+        payload.extend_from_slice(body);
+        segment(0xe1, &payload)
     }
 
     #[test]
@@ -214,5 +434,120 @@ mod tests {
             assert!(!scan.saw_exif);
             assert!(scan.records.is_empty());
         }
+    }
+
+    #[test]
+    fn fixture_18_midjourney_description_is_labeled_at_sink_flush() {
+        let packet = xmp_packet(
+            "<rdf:Description xmlns:dc='http://purl.org/dc/elements/1.1/'><dc:description>a cat --ar 1:1</dc:description></rdf:Description>",
+        );
+        let mut jpeg = b"\xff\xd8".to_vec();
+        jpeg.extend_from_slice(&main_xmp_segment(&packet));
+        jpeg.extend_from_slice(b"\xff\xda");
+
+        let parsed = scan(&jpeg);
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.records[0].label, "XMP Description");
+        let mut sink = TextSink::default();
+        for record in parsed.records {
+            sink.push_record(record);
+        }
+        let mut output = Vec::new();
+        sink.flush(&mut output).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "--- Midjourney (XMP) ---\na cat --ar 1:1\n"
+        );
+    }
+
+    #[test]
+    fn fixture_19_reads_com_as_a1111_or_jpeg_comment() {
+        let mut jpeg = b"\xff\xd8".to_vec();
+        jpeg.extend_from_slice(&segment(
+            0xfe,
+            b"prompt\nNegative prompt: blurry\nSteps: 20",
+        ));
+        jpeg.extend_from_slice(&segment(0xfe, b"plain comment"));
+        jpeg.extend_from_slice(b"\xff\xda");
+
+        let parsed = scan(&jpeg);
+        assert_eq!(parsed.records.len(), 2);
+        assert_eq!(parsed.records[0].source, Source::JpegComment);
+        assert_eq!(parsed.records[0].label, "Stable Diffusion (A1111)");
+        assert_eq!(parsed.records[1].label, "JPEG Comment");
+        assert_eq!(parsed.records[1].body, "plain comment");
+    }
+
+    #[test]
+    fn fixture_33_reassembles_extended_xmp_fragments_out_of_order() {
+        let guid = b"0123456789abcdef0123456789ABCDEF";
+        let extension = xmp_packet(
+            "<rdf:Description xmlns:i='http://iptc.org/std/Iptc4xmpExt/2008-02-29/'><i:AIPromptInformation>extended prompt</i:AIPromptInformation></rdf:Description>",
+        );
+        let split = extension.len() / 2;
+        let mut jpeg = b"\xff\xd8".to_vec();
+        jpeg.extend_from_slice(&main_xmp_segment(&xmp_packet(&format!(
+            "<rdf:Description xmlns:n='http://ns.adobe.com/xap/1.0/note/' n:HasExtendedXMP='{}'/>",
+            String::from_utf8_lossy(guid)
+        ))));
+        jpeg.extend_from_slice(&extended_xmp_segment(
+            guid,
+            extension.len(),
+            split,
+            &extension[split..],
+        ));
+        jpeg.extend_from_slice(&extended_xmp_segment(
+            guid,
+            extension.len(),
+            0,
+            &extension[..split],
+        ));
+        jpeg.extend_from_slice(b"\xff\xda");
+
+        let parsed = scan(&jpeg);
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.records[0].source, Source::JpegXmp);
+        assert_eq!(parsed.records[0].label, "XMP AIPromptInformation");
+        assert_eq!(parsed.records[0].body, "extended prompt");
+    }
+
+    #[test]
+    fn fixture_33_allows_a_valid_standalone_extended_xmp_packet() {
+        let guid = b"fedcba9876543210fedcba9876543210";
+        let extension = xmp_packet(
+            "<rdf:Description xmlns:dc='http://purl.org/dc/elements/1.1/'><dc:description>standalone extension</dc:description></rdf:Description>",
+        );
+        let mut jpeg = b"\xff\xd8".to_vec();
+        jpeg.extend_from_slice(&extended_xmp_segment(guid, extension.len(), 0, &extension));
+        jpeg.extend_from_slice(b"\xff\xda");
+
+        let parsed = scan(&jpeg);
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.records[0].body, "standalone extension");
+    }
+
+    #[test]
+    fn mismatched_extended_xmp_guid_keeps_only_the_main_packet() {
+        let guid = b"0123456789abcdef0123456789abcdef";
+        let main = xmp_packet(&format!(
+            "<rdf:Description xmlns:n='http://ns.adobe.com/xap/1.0/note/' n:HasExtendedXMP='{}' xmlns:dc='http://purl.org/dc/elements/1.1/'><dc:description>main packet</dc:description></rdf:Description>",
+            String::from_utf8_lossy(guid)
+        ));
+        let extension = xmp_packet(
+            "<rdf:Description xmlns:dc='http://purl.org/dc/elements/1.1/'><dc:title>must be ignored</dc:title></rdf:Description>",
+        );
+        let mut jpeg = b"\xff\xd8".to_vec();
+        jpeg.extend_from_slice(&main_xmp_segment(&main));
+        jpeg.extend_from_slice(&extended_xmp_segment(
+            b"fedcba9876543210fedcba9876543210",
+            extension.len(),
+            0,
+            &extension,
+        ));
+        jpeg.extend_from_slice(b"\xff\xda");
+
+        let parsed = scan(&jpeg);
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.records[0].body, "main packet");
     }
 }
