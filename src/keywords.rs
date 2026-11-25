@@ -6,6 +6,25 @@ pub struct PngKeyword {
     pub xmp_packet: bool,
 }
 
+pub fn registered() -> [&'static [u8]; 14] {
+    [
+        b"parameters",
+        b"prompt",
+        b"workflow",
+        b"generation_data",
+        b"Description",
+        b"Comment",
+        b"Title",
+        b"Software",
+        b"Source",
+        b"sui_image_params",
+        b"sui_extra_data",
+        b"invokeai_metadata",
+        b"sd-metadata",
+        b"XML:com.adobe.xmp",
+    ]
+}
+
 pub fn lookup(keyword: &[u8]) -> Option<PngKeyword> {
     let entry = match keyword {
         b"parameters" => PngKeyword {
@@ -135,5 +154,16 @@ mod tests {
         assert_eq!(lookup(b"sui_extra_data").unwrap().label, "SwarmUI [Extra]");
         assert_eq!(lookup(b"invokeai_metadata").unwrap().label, "InvokeAI");
         assert_eq!(lookup(b"sd-metadata").unwrap().label, "sd-metadata");
+    }
+
+    #[test]
+    fn registered_keyword_list_matches_the_registry() {
+        for keyword in super::registered() {
+            assert!(
+                lookup(keyword).is_some(),
+                "unregistered key in scan list: {keyword:?}"
+            );
+        }
+        assert_eq!(super::registered().len(), 14);
     }
 }
