@@ -359,6 +359,7 @@ fn json_value_text(value: &Value) -> String {
 
 fn collect_values<'a>(events: &[Event<'a>]) -> XmpValues<'a> {
     let mut values = XmpValues::default();
+    let mut element_covered_until: [Option<usize>; FIELD_COUNT] = [None; FIELD_COUNT];
     for (index, event) in events.iter().enumerate() {
         let Event::Start {
             name,
@@ -411,10 +412,14 @@ fn collect_values<'a>(events: &[Event<'a>]) -> XmpValues<'a> {
                 },
             );
         }
-        if !*empty {
-            if let Some(value) = extract_element(events, index) {
+        let field_index = field.index();
+        let not_covered = element_covered_until[field_index].map_or(true, |end| index > end);
+        if !*empty && values.fields[field_index].element.is_none() && not_covered {
+            let (value, end_index) = extract_element(events, index);
+            element_covered_until[field_index] = Some(end_index);
+            if let Some(value) = value {
                 store_first(
-                    &mut values.fields[field.index()].element,
+                    &mut values.fields[field_index].element,
                     Candidate {
                         value,
                         offset: index,
@@ -432,13 +437,10 @@ fn store_first<'a>(slot: &mut Option<Candidate<'a>>, candidate: Candidate<'a>) {
     }
 }
 
-fn extract_element<'a>(events: &[Event<'a>], start_index: usize) -> Option<Cow<'a, str>> {
-    let Event::Start { empty, .. } = events.get(start_index)? else {
-        return None;
+fn extract_element<'a>(events: &[Event<'a>], start_index: usize) -> (Option<Cow<'a, str>>, usize) {
+    let Some(Event::Start { empty: false, .. }) = events.get(start_index) else {
+        return (None, start_index);
     };
-    if *empty {
-        return None;
-    }
 
     let mut depth = 0usize;
     let mut plain = TextBuffer::default();
@@ -446,8 +448,9 @@ fn extract_element<'a>(events: &[Event<'a>], start_index: usize) -> Option<Cow<'
     let mut alt_depth = None;
     let mut item: Option<ListItem<'a>> = None;
     let mut alt = AltValue::default();
+    let mut end_index = events.len();
 
-    for event in events.iter().skip(start_index + 1) {
+    for (event_index, event) in events.iter().enumerate().skip(start_index + 1) {
         match event {
             Event::Start {
                 name,
@@ -499,6 +502,7 @@ fn extract_element<'a>(events: &[Event<'a>], start_index: usize) -> Option<Cow<'
                 }
                 if depth == 0 {
                     // The end tag for this property was reached.
+                    end_index = event_index;
                     break;
                 }
                 depth -= 1;
@@ -513,11 +517,12 @@ fn extract_element<'a>(events: &[Event<'a>], start_index: usize) -> Option<Cow<'
         }
     }
 
-    if alt_seen {
+    let value = if alt_seen {
         alt.default.or(alt.first)
     } else {
         Some(plain.finish())
-    }
+    };
+    (value, end_index)
 }
 
 fn finish_list_item<'a>(item: &mut Option<ListItem<'a>>, alt: &mut AltValue<'a>) {
@@ -525,10 +530,10 @@ fn finish_list_item<'a>(item: &mut Option<ListItem<'a>>, alt: &mut AltValue<'a>)
         return;
     };
     let text = item.text.finish();
-    if alt.first.is_none() {
+    if !text.is_empty() && alt.first.is_none() {
         alt.first = Some(text.clone());
     }
-    if item.is_default && alt.default.is_none() {
+    if item.is_default && !text.is_empty() && alt.default.is_none() {
         alt.default = Some(text);
     }
 }
@@ -873,6 +878,35 @@ mod tests {
             parse_packet(first_packet.as_bytes(), Source::JpegXmp).records[0].body,
             "premier"
         );
+    }
+
+    #[test]
+    fn xmp_rdf_alt_ignores_an_empty_x_default_item() {
+        let packet = rdf(
+            "<rdf:Description xmlns:d='http://purl.org/dc/elements/1.1/'><d:title><rdf:Alt><rdf:li xml:lang='x-default'/><rdf:li xml:lang='fr'>premier non vide</rdf:li></rdf:Alt></d:title></rdf:Description>",
+        );
+        let parsed = parse_packet(packet.as_bytes(), Source::JpegXmp);
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.records[0].body, "premier non vide");
+    }
+
+    #[test]
+    fn nested_repeated_properties_do_not_replace_or_rescan_the_outer_value() {
+        let mut properties =
+            String::from("<rdf:Description xmlns:d='http://purl.org/dc/elements/1.1/'>");
+        properties.push_str("<d:description>outer");
+        for _ in 0..512 {
+            properties.push_str("<d:description>");
+        }
+        properties.push_str("inner");
+        for _ in 0..512 {
+            properties.push_str("</d:description>");
+        }
+        properties.push_str("tail</d:description></rdf:Description>");
+        let packet = rdf(&properties);
+        let parsed = parse_packet(packet.as_bytes(), Source::JpegXmp);
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.records[0].body, "outerinnertail");
     }
 
     #[test]
