@@ -3,6 +3,9 @@
 
 Uses only the Python standard library. Generated fixtures are written under
 target/phase0-fixtures so they stay out of version control.
+
+The routine JPEG fixture places its 5 MiB image scan after SOS. The original
+APP2-before-SOS layout is retained separately as a segment-walk stress case.
 """
 
 from __future__ import annotations
@@ -144,7 +147,7 @@ def minimal_jpeg_image() -> bytes:
     )
 
 
-def generate_jpeg(path: Path) -> None:
+def jpeg_exif_payload() -> bytes:
     comment = b"ASCII\0\0\0parameters=phase0 JPEG baseline"
     tiff = bytearray(b"II*\0" + struct.pack("<I", 8))
     tiff.extend(struct.pack("<H", 1))
@@ -153,12 +156,26 @@ def generate_jpeg(path: Path) -> None:
     tiff.extend(struct.pack("<I", 26))
     tiff.extend(struct.pack("<I", 0))
     tiff.extend(comment)
-    exif = b"Exif\0\0" + bytes(tiff)
+    return b"Exif\0\0" + bytes(tiff)
 
+
+def generate_jpeg(path: Path) -> None:
+    """Generate a 5 MiB JPEG whose image data follows SOS."""
+    target_size = 5 * 1024 * 1024
+    image = minimal_jpeg_image()
+    prefix = b"\xff\xd8" + jpeg_segment(0xE1, jpeg_exif_payload()) + image[:-3]
+    scan_data_size = target_size - len(prefix) - 2  # Leave room for EOI.
+    if scan_data_size < 1:
+        raise RuntimeError("JPEG headers exceed the 5 MiB performance fixture size")
+    path.write_bytes(prefix + b"\x3f" + bytes(scan_data_size - 1) + b"\xff\xd9")
+
+
+def generate_jpeg_app2_stress(path: Path) -> None:
+    """Keep the original 5 MiB APP2-before-SOS fixture as a stress case."""
     target_size = 5 * 1024 * 1024
     image = minimal_jpeg_image()
     jpeg = bytearray(b"\xff\xd8")
-    jpeg.extend(jpeg_segment(0xE1, exif))
+    jpeg.extend(jpeg_segment(0xE1, jpeg_exif_payload()))
     while len(jpeg) + len(image) < target_size:
         remaining = target_size - len(jpeg) - len(image)
         if remaining < 4:
@@ -200,6 +217,7 @@ def fixture_paths(directory: Path) -> dict[str, Path]:
         "PNG ComfyUI 10 MiB IDAT + workflow": directory / "comfy-10mb-workflow.png",
         "PNG Stealth 2048x2048 RGBA": directory / "stealth-2048-rgba.png",
         "JPEG 5 MiB with EXIF": directory / "jpeg-5mb-exif.jpg",
+        "JPEG 5 MiB APP2-before-SOS stress": directory / "jpeg-5mb-app2-stress.jpg",
         "PNG absent, many small IDAT chunks": directory / "absent-many-idat.png",
         "PNG absent, browser canvas style": directory / "absent-canvas.png",
         "PNG absent, single large photo IDAT": directory / "absent-photo.png",
@@ -210,9 +228,29 @@ def generate_fixtures(paths: dict[str, Path]) -> None:
     generate_comfy_png(paths["PNG ComfyUI 10 MiB IDAT + workflow"])
     generate_stealth_png(paths["PNG Stealth 2048x2048 RGBA"])
     generate_jpeg(paths["JPEG 5 MiB with EXIF"])
+    generate_jpeg_app2_stress(paths["JPEG 5 MiB APP2-before-SOS stress"])
     generate_absent_many_idat(paths["PNG absent, many small IDAT chunks"])
     generate_absent_canvas(paths["PNG absent, browser canvas style"])
     generate_absent_photo(paths["PNG absent, single large photo IDAT"])
+    validate_jpeg_fixture_layout(paths)
+
+
+def validate_jpeg_fixture_layout(paths: dict[str, Path]) -> None:
+    target_size = 5 * 1024 * 1024
+    normal = paths["JPEG 5 MiB with EXIF"].read_bytes()
+    stress = paths["JPEG 5 MiB APP2-before-SOS stress"].read_bytes()
+    normal_sos = normal.find(b"\xff\xda")
+    stress_sos = stress.find(b"\xff\xda")
+    if len(normal) != target_size or not 0 <= normal_sos < 1024:
+        raise RuntimeError("routine JPEG fixture must place SOS in the first 1 KiB")
+    if len(normal) - normal_sos < 4 * 1024 * 1024:
+        raise RuntimeError("routine JPEG fixture must put at least 4 MiB after SOS")
+    if (
+        len(stress) != target_size
+        or stress_sos < 4 * 1024 * 1024
+        or stress[:stress_sos].count(b"\xff\xe2") < 32
+    ):
+        raise RuntimeError("APP2 stress fixture must keep many segments before SOS")
 
 
 def binary_model_name() -> str:
@@ -280,6 +318,10 @@ def main() -> None:
         "PNG ComfyUI 10 MiB IDAT + workflow": ("workflow", '"fixture":"comfy-workflow"'),
         "PNG Stealth 2048x2048 RGBA": ("Stealth PNG Info", "Stealth performance fixture"),
         "JPEG 5 MiB with EXIF": ("EXIF UserComment", "phase0 JPEG baseline"),
+        "JPEG 5 MiB APP2-before-SOS stress": (
+            "EXIF UserComment",
+            "phase0 JPEG baseline",
+        ),
         "PNG absent, many small IDAT chunks": ("(No metadata detected)",),
         "PNG absent, browser canvas style": ("(No metadata detected)",),
         "PNG absent, single large photo IDAT": ("(No metadata detected)",),
