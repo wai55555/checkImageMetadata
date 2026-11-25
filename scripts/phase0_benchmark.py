@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the §11.4 performance fixtures and measure the v1.2.0 CLI.
+"""Generate the §11.4 performance fixtures and measure the selected CLI binary.
 
 Uses only the Python standard library. Generated fixtures are written under
 target/phase0-fixtures so they stay out of version control.

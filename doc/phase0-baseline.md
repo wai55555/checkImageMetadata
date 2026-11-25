@@ -48,7 +48,7 @@ The script regenerates fixtures under ignored `target/phase0-fixtures/`, discard
 
 | Fixture | File size | Median |
 |---|---:|---:|
-| ComfyUI PNG, 10,449,686-byte IDAT plus trailing workflow | 10,449,792 bytes | 4.905 ms |
+| ComfyUI PNG, 10,449,686-byte IDAT plus trailing workflow | 10,449,804 bytes | 4.905 ms |
 | Stealth PNG, 2048×2048 RGBA, 450 KiB text payload | 85,578 bytes | 48.907 ms |
 | JPEG, 5 MiB with EXIF UserComment (APP2 padding before SOS; now the stress case) | 5,242,880 bytes | 4.039 ms |
 | PNG without metadata, many 4 KiB IDAT chunks | 2,367,759 bytes | 13.532 ms |
