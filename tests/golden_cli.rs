@@ -161,7 +161,7 @@ fn webp_with_xmp_parameters(parameters: &str) -> Vec<u8> {
     let xmp = format!(r#"<x:xmpmeta xmlns:x="adobe:ns:meta/" parameters="{parameters}"/>"#);
     let mut riff_body = b"WEBP".to_vec();
     // VP8X declares XMP metadata; VP8L contains a valid 2x2 lossless image.
-    riff_body.extend_from_slice(&webp_chunk(b"VP8X", &[0x08, 0, 0, 0, 1, 0, 0, 1, 0, 0]));
+    riff_body.extend_from_slice(&webp_chunk(b"VP8X", &[0x04, 0, 0, 0, 1, 0, 0, 1, 0, 0]));
     riff_body.extend_from_slice(&webp_chunk(
         b"VP8L",
         &[
