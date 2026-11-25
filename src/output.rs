@@ -25,31 +25,45 @@ impl<'a> TextSink<'a> {
 
     pub fn flush<W: Write>(&mut self, writer: &mut W) -> io::Result<()> {
         let mut merged: Vec<MergedRecord<'a>> = Vec::new();
-        let mut candidates: HashMap<(usize, u64), Vec<usize>> = HashMap::new();
+        let mut body_groups: HashMap<(usize, u64), Vec<BodyGroup<'a>>> = HashMap::new();
         for record in self.records.drain(..) {
             let mut hasher = DefaultHasher::new();
             record.body.hash(&mut hasher);
             let key = (record.body.len(), hasher.finish());
             let origin = RecordOrigin::from_record(&record);
-            let match_index = candidates.get(&key).and_then(|indices| {
-                indices.iter().copied().find(|&index| {
-                    let existing = &merged[index];
-                    existing.record.body.as_ref() == record.body.as_ref()
-                        && existing.origins.iter().all(|existing_origin| {
-                            existing_origin.source != origin.source
-                                || existing_origin.detail != origin.detail
-                        })
+            let group_index = body_groups.get(&key).and_then(|groups| {
+                groups.iter().position(|group| {
+                    merged[group.representative].record.body.as_ref() == record.body.as_ref()
                 })
             });
-            if let Some(index) = match_index {
-                merged[index].origins.push(origin);
+            if let Some(group_index) = group_index {
+                let group = &mut body_groups.get_mut(&key).expect("group was found")[group_index];
+                let occurrence = group.occurrences.entry(origin.identity()).or_default();
+                let index = *occurrence;
+                *occurrence += 1;
+                if let Some(&merged_index) = group.records.get(index) {
+                    merged[merged_index].origins.push(origin);
+                } else {
+                    let merged_index = merged.len();
+                    group.records.push(merged_index);
+                    merged.push(MergedRecord {
+                        record,
+                        origins: vec![origin],
+                    });
+                }
             } else {
                 let index = merged.len();
+                let mut occurrences = HashMap::new();
+                occurrences.insert(origin.identity(), 1);
                 merged.push(MergedRecord {
                     record,
                     origins: vec![origin],
                 });
-                candidates.entry(key).or_default().push(index);
+                body_groups.entry(key).or_default().push(BodyGroup {
+                    representative: index,
+                    records: vec![index],
+                    occurrences,
+                });
             }
         }
 
@@ -73,6 +87,18 @@ impl<'a> TextSink<'a> {
 struct MergedRecord<'a> {
     record: RecordView<'a>,
     origins: Vec<RecordOrigin<'a>>,
+}
+
+struct BodyGroup<'a> {
+    representative: usize,
+    records: Vec<usize>,
+    occurrences: HashMap<OriginKey<'a>, usize>,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct OriginKey<'a> {
+    source: Source,
+    chunk_kind: Option<Cow<'a, str>>,
 }
 
 struct RecordOrigin<'a> {
@@ -100,6 +126,15 @@ impl<'a> RecordOrigin<'a> {
             (Some(keyword), _, _) => format!("{source} {keyword}"),
             (None, Some(detail), Source::PngText) => format!("{detail}"),
             _ => source.to_owned(),
+        }
+    }
+
+    fn identity(&self) -> OriginKey<'a> {
+        OriginKey {
+            source: self.source,
+            chunk_kind: (self.source == Source::PngText)
+                .then(|| self.detail.clone())
+                .flatten(),
         }
     }
 }
@@ -265,6 +300,58 @@ mod tests {
         assert_eq!(
             String::from_utf8(output).unwrap(),
             "--- Stable Diffusion (A1111) ---\nsame text\n(also in: tEXt parameters)\n"
+        );
+    }
+
+    #[test]
+    fn text_sink_does_not_treat_trailing_labels_as_chunk_kinds() {
+        let mut sink = TextSink::default();
+        sink.push_record(record(
+            Source::Trailing,
+            "Trailing Data (after IEND)",
+            "same trailing body",
+            Some("parameters"),
+            Some("first label"),
+        ));
+        sink.push_record(record(
+            Source::Trailing,
+            "Trailing Data (after IEND)",
+            "same trailing body",
+            Some("parameters"),
+            Some("second label"),
+        ));
+        let mut output = Vec::new();
+        sink.flush(&mut output).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "--- Trailing Data (after IEND) ---\nsame trailing body\n--- Trailing Data (after IEND) ---\nsame trailing body\n"
+        );
+    }
+
+    #[test]
+    fn text_sink_pairs_cross_source_occurrences_without_collapsing_repeats() {
+        let mut sink = TextSink::default();
+        for _ in 0..2 {
+            sink.push_record(record(
+                Source::PngText,
+                "Stable Diffusion (A1111)",
+                "same text",
+                Some("parameters"),
+                Some("tEXt"),
+            ));
+        }
+        sink.push_record(record(
+            Source::JpegExif,
+            "EXIF ImageDescription",
+            "same text",
+            Some("ImageDescription"),
+            None,
+        ));
+        let mut output = Vec::new();
+        sink.flush(&mut output).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "--- Stable Diffusion (A1111) ---\nsame text\n(also in: jpeg_exif ImageDescription)\n--- Stable Diffusion (A1111) ---\nsame text\n"
         );
     }
 }
