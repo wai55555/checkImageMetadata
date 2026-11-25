@@ -72,6 +72,132 @@ const MAX_STEALTH_IDAT_BYTES: usize = 512 * 1024 * 1024;
 const STEALTH_HEADER_BITS: usize = ("stealth_pnginfo".len() * 8) + 32;
 const STEALTH_SIGNATURE_BYTES: usize = "stealth_pnginfo".len();
 
+struct StealthBitCursor<'a> {
+    decoded: &'a [u8],
+    height: usize,
+    available_rows: usize,
+    row_bytes: usize,
+    row_stride: usize,
+    bytes_per_pixel: usize,
+    bytes_per_sample: usize,
+    channel_count: usize,
+    bit_capacity: usize,
+    bits_read: usize,
+    x: usize,
+    y: usize,
+    channel_idx: usize,
+    row_start: usize,
+    sample_offset: usize,
+    pixel_sample_start: usize,
+    sample_index: usize,
+}
+
+impl<'a> StealthBitCursor<'a> {
+    fn new(
+        decoded: &'a [u8],
+        width: usize,
+        height: usize,
+        available_rows: usize,
+        row_bytes: usize,
+        bytes_per_pixel: usize,
+        bytes_per_sample: usize,
+        sample_channel: Option<usize>,
+    ) -> Option<Self> {
+        let row_stride = row_bytes.checked_add(1)?;
+        let available_size = row_stride.checked_mul(available_rows)?;
+        // The caller supplies only fully reconstructed rows. Full expansion verifies exact size
+        // before constructing this cursor; the incremental path must pass its completed-row count.
+        let decoded = decoded.get(..available_size)?;
+        let sample_offset = usize::from(bytes_per_sample == 2);
+        let channel_count = if sample_channel.is_some() { 1 } else { 3 };
+        let pixel_count = if available_rows == height {
+            width.checked_mul(height)?
+        } else {
+            available_rows
+        };
+        let bit_capacity = pixel_count.checked_mul(channel_count)?;
+        let sample_index = sample_channel.unwrap_or(0).checked_mul(bytes_per_sample)?;
+        if available_rows == 0
+            || width == 0
+            || sample_index.checked_add(sample_offset)? >= row_bytes
+        {
+            return None;
+        }
+
+        Some(Self {
+            decoded,
+            height,
+            available_rows,
+            row_bytes,
+            row_stride,
+            bytes_per_pixel,
+            bytes_per_sample,
+            channel_count,
+            bit_capacity,
+            bits_read: 0,
+            x: 0,
+            y: 0,
+            channel_idx: 0,
+            row_start: 0,
+            sample_offset,
+            pixel_sample_start: sample_index,
+            sample_index,
+        })
+    }
+
+    fn next_bit(&mut self) -> Option<u8> {
+        if self.bits_read >= self.bit_capacity || self.y >= self.available_rows {
+            return None;
+        }
+        // Row boundaries are validated at cursor creation and when advancing rows; keep the hot
+        // path to one indexed LSB read per bit. In 16-bit samples sample_offset is byte two.
+        let value = self.decoded[self.row_start + 1 + self.sample_index + self.sample_offset] & 1;
+        self.bits_read += 1;
+
+        if self.bits_read < self.bit_capacity {
+            if self.channel_count == 1 {
+                self.advance_pixel()?;
+            } else {
+                self.channel_idx += 1;
+                self.sample_index += self.bytes_per_sample;
+                if self.channel_idx == 3 {
+                    self.channel_idx = 0;
+                    self.sample_index = self.pixel_sample_start;
+                    self.advance_pixel()?;
+                }
+            }
+        }
+        Some(value)
+    }
+
+    fn advance_pixel(&mut self) -> Option<()> {
+        self.y += 1;
+        if self.y == self.height {
+            self.y = 0;
+            self.x = self.x.checked_add(1)?;
+            self.row_start = 0;
+            self.pixel_sample_start = self.pixel_sample_start.checked_add(self.bytes_per_pixel)?;
+            self.sample_index = self.pixel_sample_start;
+        } else {
+            self.row_start = self.row_start.checked_add(self.row_stride)?;
+        }
+        // Each reconstructed row has one filter byte followed by row_bytes sample bytes.
+        if self.y < self.available_rows {
+            self.decoded
+                .get(self.row_start + 1..self.row_start + 1 + self.row_bytes)?;
+        }
+        Some(())
+    }
+
+    fn next_byte(&mut self) -> Option<u8> {
+        let mut byte = 0u8;
+        for bit_in_byte in 0..8 {
+            byte |= self.next_bit()? << (7 - bit_in_byte);
+        }
+        Some(byte)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum StealthPolicy {
     #[default]
@@ -251,49 +377,33 @@ fn check_stealth_png(png: &[u8]) -> Option<(String, String, String)> {
         }
     }
 
-    let total_pixels = width.checked_mul(height)?;
     for mode in ["Alpha", "RGB"] {
-        let mode_channels = match (mode, color_type) {
-            ("Alpha", 4) => vec![1usize],
-            ("Alpha", 6) => vec![3usize],
-            ("RGB", 2 | 6) => vec![0usize, 1usize, 2usize],
+        let sample_channel = match (mode, color_type) {
+            ("Alpha", 4) => Some(1usize),
+            ("Alpha", 6) => Some(3usize),
+            ("RGB", 2 | 6) => None,
             _ => continue,
         };
-        let channel_bits = total_pixels.checked_mul(mode_channels.len())?;
+        let Some(mut bit_cursor) = StealthBitCursor::new(
+            &decoded,
+            width,
+            height,
+            height,
+            row_bytes,
+            bytes_per_pixel,
+            bytes_per_sample,
+            sample_channel,
+        ) else {
+            return None;
+        };
+        let channel_bits = bit_cursor.bit_capacity;
         if channel_bits < STEALTH_HEADER_BITS {
             continue;
         }
 
-        let read_stream_byte = |byte_index: usize| -> Option<u8> {
-            let mut result = 0u8;
-            for bit_in_byte in 0..8 {
-                let bit_index = byte_index.checked_mul(8)?.checked_add(bit_in_byte)?;
-                if bit_index >= channel_bits {
-                    return None;
-                }
-                let (pixel_index, channel) = if mode == "Alpha" {
-                    (bit_index, mode_channels[0])
-                } else {
-                    (bit_index / 3, mode_channels[bit_index % 3])
-                };
-                // 拡張機能と同じ列優先の座標: pixelIndex = x * height + y。
-                let x = pixel_index / height;
-                let y = pixel_index % height;
-                let row_start = y.checked_mul(row_bytes.checked_add(1)?)?;
-                let sample_offset = if bit_depth == 16 { 1 } else { 0 };
-                let sample_index = x
-                    .checked_mul(bytes_per_pixel)?
-                    .checked_add(channel.checked_mul(bytes_per_sample)?)?
-                    .checked_add(sample_offset)?;
-                let value = *decoded.get(row_start.checked_add(1)?.checked_add(sample_index)?)? & 1;
-                result |= value << (7 - bit_in_byte);
-            }
-            Some(result)
-        };
-
         let mut header = [0u8; STEALTH_SIGNATURE_BYTES + 4];
-        for (index, byte) in header.iter_mut().enumerate() {
-            *byte = read_stream_byte(index)?;
+        for byte in &mut header {
+            *byte = bit_cursor.next_byte()?;
         }
         let signature_bytes = &header[..STEALTH_SIGNATURE_BYTES];
         let (signature, signature_mode, compressed) = if signature_bytes == b"stealth_pnginfo" {
@@ -322,8 +432,8 @@ fn check_stealth_png(png: &[u8]) -> Option<(String, String, String)> {
             continue;
         }
         let mut payload = Vec::with_capacity(payload_len);
-        for index in 0..payload_len {
-            payload.push(read_stream_byte(header.len().checked_add(index)?)?);
+        for _ in 0..payload_len {
+            payload.push(bit_cursor.next_byte()?);
         }
         let text_bytes = if compressed {
             let Some(output) = inflate_stealth_payload(&payload) else {

@@ -48,23 +48,56 @@ fn compress(data: &[u8]) -> Vec<u8> {
 }
 
 fn stealth_png(payload: &[u8], text_chunk: Option<Vec<u8>>) -> Vec<u8> {
-    let mut stream = b"stealth_pnginfo".to_vec();
-    stream.extend_from_slice(&((payload.len() * 8) as u32).to_be_bytes());
-    stream.extend_from_slice(payload);
+    stealth_png_variant(payload, "stealth_pnginfo", 8, false, false, text_chunk)
+}
 
-    // Alpha bits are read down the first column, one reconstructed row per bit.
-    let height = stream.len() * 8;
-    let mut raw = Vec::with_capacity(height * 5);
-    for bit_index in 0..height {
+fn stealth_png_variant(
+    payload: &[u8],
+    signature: &str,
+    bit_depth: u8,
+    rgb: bool,
+    compressed: bool,
+    text_chunk: Option<Vec<u8>>,
+) -> Vec<u8> {
+    let encoded_payload = if compressed {
+        compress(payload)
+    } else {
+        payload.to_vec()
+    };
+    let mut stream = signature.as_bytes().to_vec();
+    stream.extend_from_slice(&((encoded_payload.len() * 8) as u32).to_be_bytes());
+    stream.extend_from_slice(&encoded_payload);
+
+    // Use multiple columns so fixtures cover the extension's column-major pixel order.
+    let channels_per_stream_pixel = if rgb { 3 } else { 1 };
+    let stream_pixel_count = (stream.len() * 8).div_ceil(channels_per_stream_pixel);
+    let height = stream_pixel_count.min(23);
+    let width = stream_pixel_count.div_ceil(height);
+    let bytes_per_sample = usize::from(bit_depth / 8);
+    let row_bytes = width * 4 * bytes_per_sample;
+    let row_stride = row_bytes + 1;
+    let mut raw = vec![0; height * row_stride];
+    for bit_index in 0..stream.len() * 8 {
         let bit = (stream[bit_index / 8] >> (7 - bit_index % 8)) & 1;
-        raw.extend_from_slice(&[0, 0, 0, 0, bit]);
+        let pixel_index = bit_index / channels_per_stream_pixel;
+        let x = pixel_index / height;
+        let y = pixel_index % height;
+        let channel_idx = if rgb {
+            bit_index % channels_per_stream_pixel
+        } else {
+            3
+        };
+        let sample_offset = usize::from(bit_depth == 16);
+        let sample_index =
+            x * 4 * bytes_per_sample + channel_idx * bytes_per_sample + sample_offset;
+        raw[y * row_stride + 1 + sample_index] |= bit;
     }
 
     let mut png = PNG_SIGNATURE.to_vec();
     let mut ihdr = Vec::with_capacity(13);
-    ihdr.extend_from_slice(&1u32.to_be_bytes());
+    ihdr.extend_from_slice(&(width as u32).to_be_bytes());
     ihdr.extend_from_slice(&(height as u32).to_be_bytes());
-    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    ihdr.extend_from_slice(&[bit_depth, 6, 0, 0, 0]);
     png.extend_from_slice(&png_chunk(b"IHDR", &ihdr));
     if let Some(chunk) = text_chunk {
         png.extend_from_slice(&chunk);
@@ -125,6 +158,56 @@ fn fixture_12_always_shows_stealth_alongside_normal_metadata() {
     let auto_output = run_cli(&["--stealth", "auto", path]);
     assert!(auto_output.contains("prompt=ordinary metadata"));
     assert!(!auto_output.contains("Stealth PNG Info"));
+}
+
+#[test]
+fn fixture_31_reads_16_bit_alpha_from_the_second_sample_byte() {
+    let bytes = stealth_png_variant(
+        b"fixture 31 16-bit payload",
+        "stealth_pnginfo",
+        16,
+        false,
+        false,
+        None,
+    );
+    let png = TempPng::new(&bytes);
+    let output = run_cli(&[png.path.to_str().unwrap()]);
+
+    assert!(output.contains("fixture 31 16-bit payload"));
+}
+
+#[test]
+fn fixture_31_reads_rgb_channel_stream() {
+    let bytes = stealth_png_variant(
+        b"fixture 31 RGB payload",
+        "stealth_rgbinfo",
+        8,
+        true,
+        false,
+        None,
+    );
+    let png = TempPng::new(&bytes);
+    let output = run_cli(&[png.path.to_str().unwrap()]);
+
+    assert!(output.contains("Stealth PNG Info (RGB) [stealth_rgbinfo]"));
+    assert!(output.contains("fixture 31 RGB payload"));
+}
+
+#[test]
+fn fixture_31_reads_compressed_stealth_payload() {
+    let bytes = stealth_png_variant(
+        b"fixture 31 compressed payload",
+        "stealth_pngcomp",
+        8,
+        false,
+        true,
+        None,
+    );
+    let png = TempPng::new(&bytes);
+    let output = run_cli(&[png.path.to_str().unwrap()]);
+
+    assert!(output.contains("Stealth PNG Info (Alpha) [stealth_pngcomp]"));
+    assert!(output.contains("fixture 31 compressed payload"));
 }
 
 #[test]
