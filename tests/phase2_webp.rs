@@ -87,3 +87,12 @@ fn fixture_24_formats_novelai_json_from_webp_user_comment() {
     let output = run_webp(&bytes);
     assert!(output.contains("{\n  \"negative\": \"blur\",\n  \"prompt\": \"cat\"\n}"));
 }
+
+#[test]
+fn fixture_37_reads_webp_exif_past_a_zero_riff_size_field() {
+    let tiff = tiff_with_comment(b"ASCII\0\0\0parameters=past-zero-riff-size");
+    let bytes = webp_with_chunks(&[(b"EXIF", &tiff)], Some(0));
+    let output = run_webp(&bytes);
+    assert!(output.contains("parameters=past-zero-riff-size"));
+    assert!(!output.contains("(No metadata detected)"));
+}
