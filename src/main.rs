@@ -1,16 +1,15 @@
+pub mod jpeg;
 pub mod keywords;
 pub mod output;
 pub mod png;
 pub mod record;
+pub mod tiff;
 
 use flate2::read::{GzDecoder, ZlibDecoder};
 use memmap2::MmapOptions;
 use std::fs::File;
 use std::io::{self, Read};
 use std::str;
-
-// JPEG EXIF marker search bound; PNG now uses the chunk walker.
-const FAST_SCAN_LIMIT: usize = 65536;
 
 fn extract_png_metadata(
     mmap: &[u8],
@@ -426,36 +425,20 @@ fn extract_exif_metadata(
     format: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== {} File: {} ===", format, path);
-
-    // "Exif\0\0" を探す
-    let search_len = mmap.len().min(FAST_SCAN_LIMIT);
-    let mut tiff_start = 0;
-    for i in 0..search_len.saturating_sub(10) {
-        if &mmap[i..i + 6] == b"Exif\0\0" {
-            tiff_start = i + 6;
-            break;
+    let parsed = jpeg::scan(mmap);
+    let has_records = !parsed.records.is_empty();
+    let mut sink = output::TextSink::default();
+    for record in parsed.records {
+        sink.push_record(record);
+    }
+    sink.flush(&mut io::stdout().lock())?;
+    if !has_records {
+        if parsed.saw_exif {
+            println!("(No metadata detected)");
+        } else {
+            println!("(No EXIF marker found)");
         }
     }
-    if tiff_start == 0 {
-        println!("(No EXIF marker found)");
-        return Ok(());
-    }
-
-    // UserComment 0x9286 を探す (簡易)
-    let tag_id = [0x86, 0x92];
-    for i in tiff_start..search_len.saturating_sub(12) {
-        if mmap[i] == tag_id[0] && mmap[i + 1] == tag_id[1] {
-            // データオフセットと長さを取得 (LE前提)
-            let data_len = u32::from_le_bytes(mmap[i + 4..i + 8].try_into()?) as usize;
-            let offset_val = u32::from_le_bytes(mmap[i + 8..i + 12].try_into()?) as usize;
-            let data_offset = tiff_start + offset_val;
-            if data_offset + data_len <= mmap.len() && data_len >= 8 {
-                extract_from_exif(&mmap[data_offset..data_offset + data_len])?;
-            }
-            return Ok(());
-        }
-    }
-    println!("(No metadata detected)");
     Ok(())
 }
 
