@@ -210,7 +210,9 @@ mod tests {
             b"\xff\xd8\xff\xe1\x00\x08Exif",
         ];
         for input in cases {
-            let _ = scan(input);
+            let scan = scan(input);
+            assert!(!scan.saw_exif);
+            assert!(scan.records.is_empty());
         }
     }
 }
