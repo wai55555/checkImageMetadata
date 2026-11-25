@@ -8,6 +8,10 @@ pub struct TextSink<'a> {
 }
 
 impl<'a> TextSink<'a> {
+    pub fn push_record(&mut self, record: RecordView<'a>) {
+        self.records.push(record);
+    }
+
     pub fn len(&self) -> usize {
         self.records.len()
     }
@@ -64,5 +68,19 @@ mod tests {
             "--- Stable Diffusion (A1111) ---\npositive prompt\nNegative prompt: low quality\n"
         );
         assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn text_sink_can_take_owned_records_without_cloning_the_body() {
+        let record = RecordView {
+            source: Source::PngText,
+            label: Cow::Borrowed("workflow"),
+            body: Cow::Owned("decoded body".to_owned()),
+            keyword: Some(Cow::Borrowed("workflow")),
+            detail: None,
+        };
+        let mut sink = TextSink::default();
+        sink.push_record(record);
+        assert!(matches!(sink.records[0].body, Cow::Owned(_)));
     }
 }
