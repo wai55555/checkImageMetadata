@@ -3,6 +3,7 @@ use std::cmp::Reverse;
 use std::collections::HashSet;
 
 use crate::record::{RecordView, Source};
+use crate::xmp;
 
 const MAX_EXIF_BYTES: usize = 16 * 1024 * 1024;
 const USER_COMMENT: u16 = 0x9286;
@@ -12,6 +13,7 @@ const MODEL: u16 = 0x0110;
 const SOFTWARE: u16 = 0x0131;
 const ARTIST: u16 = 0x013b;
 const XP_COMMENT: u16 = 0x9c9c;
+const XML_PACKET: u16 = 0x02bc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ByteOrder {
@@ -192,7 +194,9 @@ fn parse_ifd<'a>(
     for index in 0..ifd.entry_count {
         let entry = reader.entry(ifd.entries_start, index)?;
         if let Some(data) = reader.value(entry) {
-            if let Some(record) = decode_tag(entry.tag, data, source) {
+            if entry.tag == XML_PACKET {
+                records.extend(xmp::parse(data, Source::TiffXmp));
+            } else if let Some(record) = decode_tag(entry.tag, data, source) {
                 records.push(record);
             }
         }
@@ -500,6 +504,17 @@ mod tests {
         assert_eq!(TiffReader::new(big).unwrap().byte_order, ByteOrder::Big);
         assert!(TiffReader::new(b"ZZ\0*\0\0\0\x08").is_none());
         assert!(TiffReader::new(b"II\0\0\0\0\0\x08").is_none());
+    }
+
+    #[test]
+    fn tiff_xml_packet_tag_uses_the_common_xmp_parser_and_source() {
+        let packet = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description xmlns:d='http://purl.org/dc/elements/1.1/'><d:title>TIFF XMP</d:title></rdf:Description></rdf:RDF></x:xmpmeta>";
+        let tiff = tiff_with_tags(&[(0x02bc, 7, packet)]);
+        let records = parse(&tiff, Source::PngExif);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source, Source::TiffXmp);
+        assert_eq!(records[0].label, "XMP Title");
+        assert_eq!(records[0].body, "TIFF XMP");
     }
 
     #[test]

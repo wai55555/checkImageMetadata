@@ -157,8 +157,10 @@ fn jpeg_segment(marker: u8, data: &[u8]) -> Vec<u8> {
     segment
 }
 
-fn webp_with_xmp_parameters(parameters: &str) -> Vec<u8> {
-    let xmp = format!(r#"<x:xmpmeta xmlns:x="adobe:ns:meta/" parameters="{parameters}"/>"#);
+fn webp_with_xmp_description(description: &str) -> Vec<u8> {
+    let xmp = format!(
+        r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:description>{description}</dc:description></rdf:Description></rdf:RDF></x:xmpmeta>"#
+    );
     let mut riff_body = b"WEBP".to_vec();
     // VP8X declares XMP metadata; VP8L contains a valid 2x2 lossless image.
     riff_body.extend_from_slice(&webp_chunk(b"VP8X", &[0x04, 0, 0, 0, 1, 0, 0, 1, 0, 0]));
@@ -246,11 +248,11 @@ fn golden_jpeg_exif_user_comment() {
 }
 
 #[test]
-fn golden_webp_xmp_parameters_attribute() {
-    let webp = webp_with_xmp_parameters("steps=20");
+fn golden_webp_xmp_description_element() {
+    let webp = webp_with_xmp_description("a WebP prompt");
     assert_cli_golden(
         "webp",
         &webp,
-        "=== WebP File: <fixture> ===\n--- WebP XMP [parameters] ---\nsteps=20\n",
+        "=== WebP File: <fixture> ===\n--- Midjourney (XMP) ---\na WebP prompt\n",
     );
 }

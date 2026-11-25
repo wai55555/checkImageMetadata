@@ -4,6 +4,7 @@ pub mod output;
 pub mod png;
 pub mod record;
 pub mod tiff;
+pub mod xmp;
 
 use flate2::read::{GzDecoder, ZlibDecoder};
 use memmap2::MmapOptions;
@@ -329,10 +330,25 @@ fn paeth_predictor(left: u8, above: u8, upper_left: u8) -> u8 {
 
 fn extract_webp_metadata(mmap: &[u8], path: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== WebP File: {} ===", path);
+    let mut sink = output::TextSink::default();
+    for record in webp_records(mmap) {
+        sink.push_record(record);
+    }
+    let found = !sink.is_empty();
+    sink.flush(&mut io::stdout().lock())?;
+    if !found {
+        println!("(No metadata detected)");
+    }
+    Ok(())
+}
+
+fn webp_records(mmap: &[u8]) -> Vec<record::RecordView<'_>> {
+    if mmap.get(..4) != Some(b"RIFF") || mmap.get(8..12) != Some(b"WEBP") {
+        return Vec::new();
+    }
     let mut cursor = 12usize;
     let len = mmap.len();
-    let mut found = false;
-
+    let mut records = Vec::new();
     while let Some(header_end) = cursor.checked_add(8) {
         if header_end > len {
             break;
@@ -360,31 +376,12 @@ fn extract_webp_metadata(mmap: &[u8], path: &str) -> Result<(), Box<dyn std::err
 
         if chunk_type == b"EXIF" {
             let exif_data = &mmap[data_start..data_end];
-            let records = tiff::parse(exif_data, record::Source::WebpExif);
-            if !records.is_empty() {
-                let mut sink = output::TextSink::default();
-                for record in records {
-                    sink.push_record(record);
-                }
-                sink.flush(&mut io::stdout().lock())?;
-                found = true;
-            }
+            records.extend(tiff::parse(exif_data, record::Source::WebpExif));
         } else if chunk_type == b"XMP " {
-            let xmp_data = &mmap[data_start..data_end];
-            if let Ok(xmp_str) = std::str::from_utf8(xmp_data) {
-                // XMLから簡易的に parameters 属性を抽出
-                if let Some(start) = xmp_str.find("parameters=\"") {
-                    let rest = &xmp_str[start + 12..];
-                    if let Some(end) = rest.find('\"') {
-                        let params = &rest[..end];
-                        // 実体参照のデコードは簡易的に
-                        let decoded = params.replace("&quot;", "\"").replace("&#10;", "\n");
-                        println!("--- WebP XMP [parameters] ---");
-                        println!("{}", decoded);
-                        found = true;
-                    }
-                }
-            }
+            records.extend(xmp::parse(
+                &mmap[data_start..data_end],
+                record::Source::WebpXmp,
+            ));
         }
 
         let Some(next_cursor) = data_end.checked_add(chunk_size % 2) else {
@@ -392,11 +389,7 @@ fn extract_webp_metadata(mmap: &[u8], path: &str) -> Result<(), Box<dyn std::err
         };
         cursor = next_cursor;
     }
-
-    if !found {
-        println!("(No metadata detected)");
-    }
-    Ok(())
+    records
 }
 
 fn extract_exif_metadata(
@@ -461,5 +454,44 @@ fn main() {
     if let Err(e) = extract_universal_metadata(image_path, strict) {
         eprintln!("Error: {}", e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod webp_tests {
+    use super::webp_records;
+    use crate::record::Source;
+
+    fn webp_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(kind);
+        chunk.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        chunk.extend_from_slice(data);
+        if data.len() % 2 != 0 {
+            chunk.push(0);
+        }
+        chunk
+    }
+
+    fn webp(chunks: &[Vec<u8>]) -> Vec<u8> {
+        let mut body = b"WEBP".to_vec();
+        for chunk in chunks {
+            body.extend_from_slice(chunk);
+        }
+        let mut image = b"RIFF".to_vec();
+        image.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        image.extend_from_slice(&body);
+        image
+    }
+
+    #[test]
+    fn fixture_23_reads_webp_xmp_element_description() {
+        let packet = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description xmlns:d='http://purl.org/dc/elements/1.1/'><d:description>a WebP prompt</d:description></rdf:Description></rdf:RDF></x:xmpmeta>";
+        let image = webp(&[webp_chunk(b"XMP ", packet)]);
+        let records = webp_records(&image);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source, Source::WebpXmp);
+        assert_eq!(records[0].label, "XMP Description");
+        assert_eq!(records[0].body, "a WebP prompt");
     }
 }
