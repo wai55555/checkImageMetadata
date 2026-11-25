@@ -1,3 +1,6 @@
+pub mod output;
+pub mod record;
+
 use memmap2::MmapOptions;
 use std::fs::File;
 use std::io::{self, Read};
