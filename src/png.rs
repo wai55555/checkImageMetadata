@@ -120,8 +120,7 @@ pub fn scan<'a>(bytes: &'a [u8], strict: bool) -> PngScan<'a> {
 
     let mut post_idat = Vec::new();
     let mut resolved = directly_after_idat;
-    let mut chain_progress =
-        iend.map(|iend_at| reverse_chain(bytes, first_idat, iend_at, INITIAL_WINDOW));
+    let mut chain_progress = reverse_chain_if_needed(bytes, first_idat, iend, directly_after_idat);
     if !directly_after_idat {
         if let Some(progress) = chain_progress.as_ref() {
             if let Some(chain) = progress.finish(bytes) {
@@ -137,8 +136,9 @@ pub fn scan<'a>(bytes: &'a [u8], strict: bool) -> PngScan<'a> {
     }
 
     if !resolved {
-        // Stage C. Every failed bounded walk is discarded before the next
-        // strategy. The final fallback is the only unbounded IDAT-header walk.
+        // Stage C discards each failed bounded-walk result before trying the
+        // next strategy. Partial Stage B chain records remain separately
+        // retained until a later strategy proves the complete post-IDAT range.
         let step1 = walk_post_idat(bytes, first_idat, iend, MAX_IDAT_JUMPS);
         stats.idat_header_probes += step1.probes;
         if step1.reached_iend {
@@ -604,6 +604,19 @@ fn reverse_chain(bytes: &[u8], first_idat: usize, iend: usize, window: usize) ->
     };
     follow_candidates(bytes, first_idat, &candidates, &mut progress);
     progress
+}
+
+fn reverse_chain_if_needed(
+    bytes: &[u8],
+    first_idat: usize,
+    iend: Option<usize>,
+    directly_after_idat: bool,
+) -> Option<ChainProgress> {
+    if directly_after_idat {
+        None
+    } else {
+        iend.map(|iend_at| reverse_chain(bytes, first_idat, iend_at, INITIAL_WINDOW))
+    }
 }
 
 fn extend_chain(
@@ -1221,6 +1234,17 @@ mod tests {
         assert_eq!(large_photo.stats.stage_c_step, None);
         assert_eq!(large_photo.stats.idat_header_probes, 1);
         assert!(large_photo.records.is_empty());
+    }
+
+    #[test]
+    fn directly_connected_iend_skips_reverse_chain_construction() {
+        let image = png(&[chunk(b"IDAT", &[1], true)]);
+        let stage = stage_a(&image);
+        let first_idat = stage.first_idat.unwrap();
+        let (iend, _, directly_after_idat) = find_connected_iend(&image, stage.stop);
+
+        assert!(directly_after_idat);
+        assert!(reverse_chain_if_needed(&image, first_idat, iend, directly_after_idat).is_none());
     }
 
     #[test]
