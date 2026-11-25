@@ -6,6 +6,12 @@ use crate::record::{RecordView, Source};
 
 const MAX_EXIF_BYTES: usize = 16 * 1024 * 1024;
 const USER_COMMENT: u16 = 0x9286;
+const IMAGE_DESCRIPTION: u16 = 0x010e;
+const MAKE: u16 = 0x010f;
+const MODEL: u16 = 0x0110;
+const SOFTWARE: u16 = 0x0131;
+const ARTIST: u16 = 0x013b;
+const XP_COMMENT: u16 = 0x9c9c;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ByteOrder {
@@ -185,17 +191,9 @@ fn parse_ifd<'a>(
     let mut exif_offsets = Vec::new();
     for index in 0..ifd.entry_count {
         let entry = reader.entry(ifd.entries_start, index)?;
-        if entry.tag == USER_COMMENT {
-            if let Some(data) = reader.value(entry) {
-                if let Some(body) = decode_user_comment(data) {
-                    records.push(RecordView {
-                        source,
-                        label: Cow::Borrowed("EXIF UserComment"),
-                        body,
-                        keyword: Some(Cow::Borrowed("UserComment")),
-                        detail: None,
-                    });
-                }
+        if let Some(data) = reader.value(entry) {
+            if let Some(record) = decode_tag(entry.tag, data, source) {
+                records.push(record);
             }
         }
         if follow_exif && entry.tag == 0x8769 && entry.field_type == 4 && entry.count == 1 {
@@ -222,6 +220,62 @@ fn parse_ifd<'a>(
         }
     }
     Some(ifd.next_ifd)
+}
+
+fn decode_tag<'a>(tag: u16, data: &'a [u8], source: Source) -> Option<RecordView<'a>> {
+    let (label, keyword, body) = match tag {
+        USER_COMMENT => (
+            "EXIF UserComment",
+            "UserComment",
+            decode_user_comment(data)?,
+        ),
+        IMAGE_DESCRIPTION => (
+            "EXIF ImageDescription",
+            "ImageDescription",
+            decode_ascii_field(data)?,
+        ),
+        SOFTWARE => ("EXIF Software", "Software", decode_ascii_field(data)?),
+        MAKE => ("EXIF Make", "Make", decode_ascii_field(data)?),
+        MODEL => ("EXIF Model", "Model", decode_ascii_field(data)?),
+        ARTIST => ("EXIF Artist", "Artist", decode_ascii_field(data)?),
+        XP_COMMENT => ("EXIF XPComment", "XPComment", decode_xp_comment(data)?),
+        _ => return None,
+    };
+    Some(RecordView {
+        source,
+        label: Cow::Borrowed(label),
+        body,
+        keyword: Some(Cow::Borrowed(keyword)),
+        detail: None,
+    })
+}
+
+fn decode_ascii_field(data: &[u8]) -> Option<Cow<'_, str>> {
+    let text = std::str::from_utf8(data).ok()?.trim_end_matches('\0');
+    if text.is_empty() {
+        None
+    } else {
+        Some(Cow::Borrowed(text))
+    }
+}
+
+fn decode_xp_comment(data: &[u8]) -> Option<Cow<'_, str>> {
+    if data.len() % 2 != 0 {
+        return None;
+    }
+    let mut units: Vec<u16> = data
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    while units.last() == Some(&0) {
+        units.pop();
+    }
+    let text = String::from_utf16(&units).ok()?;
+    if text.is_empty() {
+        None
+    } else {
+        Some(Cow::Owned(text))
+    }
 }
 
 fn decode_user_comment(data: &[u8]) -> Option<Cow<'_, str>> {
@@ -377,7 +431,10 @@ fn trim_trailing_nuls(mut text: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, ByteOrder, TiffReader, Utf16Order};
+    use super::{
+        parse, ByteOrder, TiffReader, Utf16Order, ARTIST, IMAGE_DESCRIPTION, MAKE, MODEL, SOFTWARE,
+        XP_COMMENT,
+    };
     use crate::record::Source;
 
     fn entry(tag: u16, field_type: u16, count: u32, value: [u8; 4]) -> Vec<u8> {
@@ -402,6 +459,32 @@ mod tests {
         tiff.extend_from_slice(&0u32.to_le_bytes());
         if comment.len() > 4 {
             tiff.extend_from_slice(comment);
+        }
+        tiff
+    }
+
+    fn tiff_with_tags(tags: &[(u16, u16, &[u8])]) -> Vec<u8> {
+        let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+        tiff.extend_from_slice(&(tags.len() as u16).to_le_bytes());
+        let mut data_offset = 8 + 2 + tags.len() * 12 + 4;
+        let mut external_values = Vec::new();
+        for (tag, field_type, value_bytes) in tags {
+            let mut value = [0u8; 4];
+            if value_bytes.len() <= 4 {
+                value[..value_bytes.len()].copy_from_slice(value_bytes);
+            } else {
+                value = (data_offset as u32).to_le_bytes();
+                external_values.push(*value_bytes);
+                data_offset += value_bytes.len();
+            }
+            tiff.extend_from_slice(&tag.to_le_bytes());
+            tiff.extend_from_slice(&field_type.to_le_bytes());
+            tiff.extend_from_slice(&(value_bytes.len() as u32).to_le_bytes());
+            tiff.extend_from_slice(&value);
+        }
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        for value in external_values {
+            tiff.extend_from_slice(value);
         }
         tiff
     }
@@ -542,5 +625,37 @@ mod tests {
         let tiff = tiff_with_comment(&unicode_comment(&long, Utf16Order::Little, false));
         let records = parse(&tiff, Source::JpegExif);
         assert_eq!(records[0].body, long);
+    }
+
+    #[test]
+    fn fixture_15_reads_image_description_and_other_display_tags_in_ifd_order() {
+        let mut xp_comment = Vec::new();
+        for unit in "Windows comment".encode_utf16().chain([0]) {
+            xp_comment.extend_from_slice(&unit.to_le_bytes());
+        }
+        let tiff = tiff_with_tags(&[
+            (IMAGE_DESCRIPTION, 2, b"parameters=from-description\0"),
+            (MAKE, 2, b"Example Camera\0"),
+            (MODEL, 2, b"Model X\0"),
+            (SOFTWARE, 2, b"Generator\0"),
+            (ARTIST, 2, b"Artist\0"),
+            (XP_COMMENT, 1, &xp_comment),
+        ]);
+
+        let records = parse(&tiff, Source::JpegExif);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (record.label.as_ref(), record.body.as_ref()))
+                .collect::<Vec<_>>(),
+            [
+                ("EXIF ImageDescription", "parameters=from-description"),
+                ("EXIF Make", "Example Camera"),
+                ("EXIF Model", "Model X"),
+                ("EXIF Software", "Generator"),
+                ("EXIF Artist", "Artist"),
+                ("EXIF XPComment", "Windows comment"),
+            ]
+        );
     }
 }
