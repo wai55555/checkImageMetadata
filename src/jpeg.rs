@@ -141,6 +141,14 @@ pub fn scan<'a>(bytes: &'a [u8]) -> JpegScan<'a> {
                     record,
                 });
             }
+        } else if marker == 0xed {
+            records.extend(parse_iptc(payload).into_iter().enumerate().map(
+                |(record_index, record)| LocatedRecord {
+                    offset: pos,
+                    record_index,
+                    record,
+                },
+            ));
         }
 
         pos = segment_end;
@@ -287,6 +295,152 @@ fn jpeg_comment_record(payload: &[u8]) -> Option<RecordView<'_>> {
     })
 }
 
+fn parse_iptc(payload: &[u8]) -> Vec<RecordView<'_>> {
+    const IRB_IDENTIFIER: &[u8] = b"Photoshop 3.0\0";
+    if !payload.starts_with(IRB_IDENTIFIER) {
+        return Vec::new();
+    }
+    let mut cursor = IRB_IDENTIFIER.len();
+    let mut records = Vec::new();
+    while cursor < payload.len() {
+        let Some(header_end) = cursor.checked_add(6) else {
+            break;
+        };
+        let Some(header) = payload.get(cursor..header_end) else {
+            break;
+        };
+        if header.get(..4) != Some(b"8BIM") {
+            break;
+        }
+        let resource_id = u16::from_be_bytes([header[4], header[5]]);
+        let Some(name_length) = payload.get(header_end).copied().map(usize::from) else {
+            break;
+        };
+        let Some(name_field_len) = 1usize
+            .checked_add(name_length)
+            .and_then(|length| length.checked_add(length % 2))
+        else {
+            break;
+        };
+        let Some(name_end) = header_end.checked_add(name_field_len) else {
+            break;
+        };
+        let Some(size_end) = name_end.checked_add(4) else {
+            break;
+        };
+        let Some(size_bytes) = payload.get(name_end..size_end) else {
+            break;
+        };
+        let Ok(size_bytes) = <[u8; 4]>::try_from(size_bytes) else {
+            break;
+        };
+        let data_start = size_end;
+        let Some(data_end) = data_start.checked_add(u32::from_be_bytes(size_bytes) as usize) else {
+            break;
+        };
+        let Some(padded_end) = data_end.checked_add((data_end - data_start) % 2) else {
+            break;
+        };
+        let Some(resource_data) = payload.get(data_start..data_end) else {
+            break;
+        };
+        if payload.get(data_end..padded_end).is_none() {
+            break;
+        }
+        if resource_id == 0x0404 {
+            records.extend(parse_iim(resource_data));
+        }
+        cursor = padded_end;
+    }
+    records
+}
+
+fn parse_iim(bytes: &[u8]) -> Vec<RecordView<'_>> {
+    let mut cursor = 0usize;
+    let mut captions = Vec::new();
+    let mut declared_utf8 = false;
+    while cursor < bytes.len() {
+        let Some(header_end) = cursor.checked_add(5) else {
+            break;
+        };
+        let Some(header) = bytes.get(cursor..header_end) else {
+            break;
+        };
+        if header[0] != 0x1c {
+            break;
+        }
+        let record_number = header[1];
+        let dataset_number = header[2];
+        let encoded_length = u16::from_be_bytes([header[3], header[4]]);
+        cursor = header_end;
+        let data_length = if encoded_length & 0x8000 == 0 {
+            usize::from(encoded_length)
+        } else {
+            let length_bytes_count = usize::from(encoded_length & 0x7fff);
+            if length_bytes_count == 0 {
+                break;
+            }
+            let Some(length_end) = cursor.checked_add(length_bytes_count) else {
+                break;
+            };
+            let Some(length_bytes) = bytes.get(cursor..length_end) else {
+                break;
+            };
+            cursor = length_end;
+            let mut length = 0usize;
+            let mut valid = true;
+            for &byte in length_bytes {
+                if let Some(next) = length
+                    .checked_mul(256)
+                    .and_then(|value| value.checked_add(usize::from(byte)))
+                {
+                    length = next;
+                } else {
+                    valid = false;
+                    break;
+                }
+            }
+            if !valid {
+                break;
+            }
+            length
+        };
+        let Some(data_end) = cursor.checked_add(data_length) else {
+            break;
+        };
+        let Some(data) = bytes.get(cursor..data_end) else {
+            break;
+        };
+        cursor = data_end;
+        match (record_number, dataset_number) {
+            (1, 90) => declared_utf8 = data == b"\x1b%G",
+            (2, 120) => captions.push(data),
+            _ => {}
+        }
+    }
+
+    captions
+        .into_iter()
+        .filter_map(|caption| {
+            let body = if declared_utf8 {
+                Cow::Borrowed(std::str::from_utf8(caption).ok()?)
+            } else {
+                match std::str::from_utf8(caption) {
+                    Ok(text) => Cow::Borrowed(text),
+                    Err(_) => Cow::Owned(caption.iter().map(|&byte| char::from(byte)).collect()),
+                }
+            };
+            (!body.is_empty()).then_some(RecordView {
+                source: Source::JpegIptc,
+                label: Cow::Borrowed("IPTC Caption"),
+                body,
+                keyword: Some(Cow::Borrowed("Caption/Abstract")),
+                detail: None,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::scan;
@@ -351,6 +505,30 @@ mod tests {
         payload.extend_from_slice(&(offset as u32).to_be_bytes());
         payload.extend_from_slice(body);
         segment(0xe1, &payload)
+    }
+
+    fn iim_dataset(record: u8, dataset: u8, body: &[u8]) -> Vec<u8> {
+        let mut data = vec![0x1c, record, dataset];
+        if body.len() <= 0x7fff {
+            data.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        } else {
+            panic!("test IIM dataset too long for short length");
+        }
+        data.extend_from_slice(body);
+        data
+    }
+
+    fn iptc_irb(iim: &[u8]) -> Vec<u8> {
+        let mut payload = b"Photoshop 3.0\0".to_vec();
+        payload.extend_from_slice(b"8BIM");
+        payload.extend_from_slice(&0x0404u16.to_be_bytes());
+        payload.extend_from_slice(&[0, 0]); // empty Pascal name and even padding
+        payload.extend_from_slice(&(iim.len() as u32).to_be_bytes());
+        payload.extend_from_slice(iim);
+        if iim.len() % 2 != 0 {
+            payload.push(0);
+        }
+        payload
     }
 
     #[test]
@@ -549,5 +727,72 @@ mod tests {
         let parsed = scan(&jpeg);
         assert_eq!(parsed.records.len(), 1);
         assert_eq!(parsed.records[0].body, "main packet");
+    }
+
+    #[test]
+    fn fixture_32_reads_exif_and_xmp_from_distinct_app1_segments() {
+        let mut exif = b"Exif\0\0".to_vec();
+        exif.extend_from_slice(&be_tiff_user_comment(b"parameters=EXIF"));
+        let xmp = xmp_packet(
+            "<rdf:Description xmlns:dc='http://purl.org/dc/elements/1.1/'><dc:title>XMP title</dc:title></rdf:Description>",
+        );
+        let mut jpeg = b"\xff\xd8".to_vec();
+        jpeg.extend_from_slice(&segment(0xe1, &exif));
+        jpeg.extend_from_slice(&main_xmp_segment(&xmp));
+        jpeg.extend_from_slice(b"\xff\xda");
+
+        let parsed = scan(&jpeg);
+        assert!(parsed.saw_exif);
+        assert_eq!(parsed.records.len(), 2);
+        assert_eq!(parsed.records[0].source, Source::JpegExif);
+        assert_eq!(parsed.records[0].body, "parameters=EXIF");
+        assert_eq!(parsed.records[1].source, Source::JpegXmp);
+        assert_eq!(parsed.records[1].body, "XMP title");
+    }
+
+    #[test]
+    fn fixture_34_reads_utf8_iptc_caption_from_app13_irb() {
+        let mut iim = iim_dataset(1, 90, b"\x1b%G");
+        iim.extend_from_slice(&iim_dataset(2, 120, "キャプション".as_bytes()));
+        let mut jpeg = b"\xff\xd8".to_vec();
+        jpeg.extend_from_slice(&segment(0xed, &iptc_irb(&iim)));
+        jpeg.extend_from_slice(b"\xff\xda");
+
+        let parsed = scan(&jpeg);
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.records[0].source, Source::JpegIptc);
+        assert_eq!(parsed.records[0].label, "IPTC Caption");
+        assert_eq!(
+            parsed.records[0].keyword.as_deref(),
+            Some("Caption/Abstract")
+        );
+        assert_eq!(parsed.records[0].body, "キャプション");
+    }
+
+    #[test]
+    fn iptc_without_utf8_declaration_uses_latin1_and_keeps_prior_captions_on_damage() {
+        let mut iim = iim_dataset(2, 120, b"caf\xe9");
+        iim.extend_from_slice(b"\x1c\x02"); // broken next dataset
+        let mut payload = iptc_irb(&iim);
+        payload.extend_from_slice(b"8BIM\x04"); // broken next IRB
+        let mut jpeg = b"\xff\xd8".to_vec();
+        jpeg.extend_from_slice(&segment(0xed, &payload));
+        jpeg.extend_from_slice(b"\xff\xda");
+
+        let parsed = scan(&jpeg);
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.records[0].body, "café");
+    }
+
+    #[test]
+    fn iptc_extended_iim_length_is_supported() {
+        let iim = vec![0x1c, 2, 120, 0x80, 0x01, 0x02, b'o', b'k'];
+        let mut jpeg = b"\xff\xd8".to_vec();
+        jpeg.extend_from_slice(&segment(0xed, &iptc_irb(&iim)));
+        jpeg.extend_from_slice(b"\xff\xda");
+
+        let parsed = scan(&jpeg);
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.records[0].body, "ok");
     }
 }
