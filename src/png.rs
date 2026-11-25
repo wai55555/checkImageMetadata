@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use crate::keywords;
 use crate::record::{RecordView, Source};
+use crate::tiff;
 
 const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 const IEND: &[u8; 12] = b"\0\0\0\0IEND\xaeB`\x82";
@@ -40,6 +41,7 @@ impl Chunk {
 #[derive(Clone, Debug)]
 struct LocatedRecord<'a> {
     offset: usize,
+    record_index: usize,
     record: RecordView<'a>,
 }
 
@@ -286,24 +288,60 @@ fn kind(bytes: &[u8; 4]) -> u32 {
 
 fn collect_chunk_records<'a>(bytes: &'a [u8], chunk: Chunk, output: &mut Vec<LocatedRecord<'a>>) {
     let data = chunk.data(bytes);
-    let record = match chunk.kind {
-        k if k == kind(b"tEXt") => parse_text(data),
-        k if k == kind(b"zTXt") => parse_ztxt(data),
-        k if k == kind(b"iTXt") => parse_itxt(data),
-        k if k == kind(b"eXIf") => handoff_exif(data),
-        _ => None,
-    };
-    if let Some(record) = record {
-        output.push(LocatedRecord {
-            offset: chunk.offset,
-            record,
-        });
+    match chunk.kind {
+        k if k == kind(b"tEXt") => append_record(
+            output,
+            chunk.offset,
+            set_text_detail(parse_text(data), "tEXt"),
+        ),
+        k if k == kind(b"zTXt") => append_record(
+            output,
+            chunk.offset,
+            set_text_detail(parse_ztxt(data), "zTXt"),
+        ),
+        k if k == kind(b"iTXt") => append_record(
+            output,
+            chunk.offset,
+            set_text_detail(parse_itxt(data), "iTXt"),
+        ),
+        k if k == kind(b"eXIf") => {
+            output.extend(
+                tiff::parse(data, Source::PngExif)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(record_index, record)| LocatedRecord {
+                        offset: chunk.offset,
+                        record_index,
+                        record,
+                    }),
+            );
+        }
+        _ => {}
     }
 }
 
-fn handoff_exif(_tiff_data: &[u8]) -> Option<RecordView<'static>> {
-    // Phase 1 establishes the typed receiver; Phase 2 supplies the TIFF parser.
-    None
+fn set_text_detail<'a>(
+    record: Option<RecordView<'a>>,
+    detail: &'static str,
+) -> Option<RecordView<'a>> {
+    record.map(|mut record| {
+        record.detail = Some(Cow::Borrowed(detail));
+        record
+    })
+}
+
+fn append_record<'a>(
+    output: &mut Vec<LocatedRecord<'a>>,
+    offset: usize,
+    record: Option<RecordView<'a>>,
+) {
+    if let Some(record) = record {
+        output.push(LocatedRecord {
+            offset,
+            record_index: 0,
+            record,
+        });
+    }
 }
 
 fn text_record<'a>(keyword_bytes: &[u8], body: Cow<'a, [u8]>) -> Option<RecordView<'a>> {
@@ -1014,6 +1052,7 @@ fn append_trailing<'a>(
                 };
                 records.push(LocatedRecord {
                     offset: start,
+                    record_index: 0,
                     record: RecordView {
                         source: Source::Trailing,
                         label: Cow::Borrowed("Trailing Data (after IEND)"),
@@ -1057,6 +1096,7 @@ fn append_trailing<'a>(
                 .unwrap_or("Trailing Data (after IEND)");
             trailing_records.push(LocatedRecord {
                 offset: start.checked_add(found).unwrap_or(start),
+                record_index: 0,
                 record: RecordView {
                     source: Source::Trailing,
                     label: Cow::Borrowed("Trailing Data (after IEND)"),
@@ -1077,10 +1117,11 @@ fn dedupe_chunk_records(records: &mut Vec<LocatedRecord<'_>>) {
         if entry.record.source == Source::Trailing {
             return true;
         }
-        if seen.contains(&entry.offset) {
+        let key = (entry.offset, entry.record_index);
+        if seen.contains(&key) {
             false
         } else {
-            seen.push(entry.offset);
+            seen.push(key);
             true
         }
     });
@@ -1120,6 +1161,48 @@ mod tests {
         chunk(b"tEXt", &data, true)
     }
 
+    fn exif_user_comment(comment: &[u8]) -> Vec<u8> {
+        let mut value = b"ASCII\0\0\0".to_vec();
+        value.extend_from_slice(comment);
+        let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&0x9286u16.to_le_bytes());
+        tiff.extend_from_slice(&7u16.to_le_bytes());
+        tiff.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        tiff.extend_from_slice(&26u32.to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend_from_slice(&value);
+        chunk(b"eXIf", &tiff, true)
+    }
+
+    fn exif_with_software_and_user_comment() -> Vec<u8> {
+        let software = b"Generator\0";
+        let mut user_comment = b"ASCII\0\0\0".to_vec();
+        user_comment.extend_from_slice(b"parameters=from-exif-ifd");
+        let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+        tiff.extend_from_slice(&2u16.to_le_bytes());
+        tiff.extend_from_slice(&0x0131u16.to_le_bytes());
+        tiff.extend_from_slice(&2u16.to_le_bytes());
+        tiff.extend_from_slice(&(software.len() as u32).to_le_bytes());
+        tiff.extend_from_slice(&((56 + user_comment.len()) as u32).to_le_bytes());
+        tiff.extend_from_slice(&0x8769u16.to_le_bytes());
+        tiff.extend_from_slice(&4u16.to_le_bytes());
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        tiff.extend_from_slice(&38u32.to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+
+        // ExifIFD is at offset 38 and its UserComment bytes begin at offset 56.
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&0x9286u16.to_le_bytes());
+        tiff.extend_from_slice(&7u16.to_le_bytes());
+        tiff.extend_from_slice(&(user_comment.len() as u32).to_le_bytes());
+        tiff.extend_from_slice(&56u32.to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend_from_slice(&user_comment);
+        tiff.extend_from_slice(software);
+        chunk(b"eXIf", &tiff, true)
+    }
+
     fn bodies(bytes: &[u8], strict: bool) -> Vec<String> {
         scan(bytes, strict)
             .records
@@ -1153,6 +1236,61 @@ mod tests {
             result.records[0].body,
             Cow::Borrowed("borrowed workflow")
         ));
+    }
+
+    #[test]
+    fn fixture_7_reads_exif_user_comment_from_png() {
+        let image = png(&[exif_user_comment(b"parameters=from-png-exif")]);
+        let result = scan(&image, false);
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].source, Source::PngExif);
+        assert_eq!(result.records[0].label, "EXIF UserComment");
+        assert_eq!(result.records[0].body, "parameters=from-png-exif");
+    }
+
+    #[test]
+    fn png_exif_keeps_distinct_tags_from_one_chunk_after_chunk_deduplication() {
+        let image = png(&[
+            exif_with_software_and_user_comment(),
+            chunk(b"IDAT", &[1, 2, 3], true),
+        ]);
+        let result = scan(&image, false);
+        assert_eq!(result.records.len(), 2);
+        assert_eq!(result.records[0].label, "EXIF Software");
+        assert_eq!(result.records[0].body, "Generator");
+        assert_eq!(result.records[1].label, "EXIF UserComment");
+        assert_eq!(result.records[1].body, "parameters=from-exif-ifd");
+    }
+
+    #[test]
+    fn fixture_40_finds_post_idat_exif_user_comment() {
+        let image = png(&[
+            chunk(b"IDAT", &[1, 2, 3], true),
+            exif_user_comment(b"parameters=post-idat-exif"),
+        ]);
+        let result = scan(&image, false);
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].body, "parameters=post-idat-exif");
+    }
+
+    #[test]
+    fn fixture_36_deduplicates_matching_text_and_exif_records() {
+        let image = png(&[
+            text(b"parameters", b"same parameters"),
+            text(b"Description", b"intervening record"),
+            exif_user_comment(b"same parameters"),
+        ]);
+        let result = scan(&image, false);
+        let mut sink = crate::output::TextSink::default();
+        for record in result.records {
+            sink.push_record(record);
+        }
+        let mut output = Vec::new();
+        sink.flush(&mut output).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "--- Stable Diffusion (A1111) ---\nsame parameters\n(also in: png_exif UserComment)\n--- NovelAI [Prompt] ---\nintervening record\n"
+        );
     }
 
     #[test]
