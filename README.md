@@ -52,6 +52,10 @@ cargo build --release
 cargo build --release --no-default-features --features portable-zlib
 ```
 
+## ライセンス
+
+MIT
+
 ## 外部ツールとの照合
 
 ExifTool が利用できる場合は、同じ画像に対して次を実行して出力を比較できます。
