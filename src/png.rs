@@ -1062,6 +1062,20 @@ fn fast_walk<'a>(
     if chunk.kind == kind(b"IDAT") {
         return None;
     }
+    // The stride predicate can become true again inside arbitrary ancillary
+    // payload bytes. Prove that the candidate is the actual end of the IDAT
+    // run by following only the chunk headers from the first IDAT.
+    let mut verified_cursor = first_idat;
+    while verified_cursor < candidate {
+        let idat = chunk_at(bytes, verified_cursor)?;
+        if idat.kind != kind(b"IDAT") || idat.end > candidate {
+            return None;
+        }
+        verified_cursor = idat.end;
+    }
+    if verified_cursor != candidate {
+        return None;
+    }
     let mut records = Vec::new();
     let mut cursor = candidate;
     loop {
@@ -1556,6 +1570,46 @@ mod tests {
         assert_eq!(result.records.len(), 1);
         assert_eq!(result.records[0].body, "after large IDAT");
         assert_eq!(result.stats.stage_c_step, Some(1));
+    }
+
+    #[test]
+    fn fast_walk_rejects_stride_aligned_idat_inside_ancillary_payload() {
+        let mut ancillary_data = vec![0x7f; 84];
+        let fake_idat = chunk(b"IDAT", &[0x42; 8], true);
+        ancillary_data[8..28].copy_from_slice(&fake_idat);
+
+        // This fake text chunk reaches the real IEND, so suffix validation
+        // alone would accept a boundary found inside the ancillary payload.
+        let mut fake_text_data = b"workflow\0false boundary".to_vec();
+        fake_text_data.resize(48, b'x');
+        let fake_text = chunk(b"tEXt", &fake_text_data, true);
+        ancillary_data[28..84].copy_from_slice(&fake_text[..56]);
+
+        let idat = chunk(b"IDAT", &[0x24; 8], true);
+        let image = png(&[
+            idat.clone(),
+            idat.clone(),
+            idat,
+            text(b"workflow", b"yes"),
+            chunk(b"vpAg", &ancillary_data, true),
+        ]);
+        let first_idat = 33;
+        let expected_iend = image.len() - 12;
+
+        assert_eq!(
+            chunk_at(&image, first_idat + 5 * 20).unwrap().kind,
+            kind(b"IDAT")
+        );
+        assert_eq!(
+            chunk_at(&image, first_idat + 6 * 20).unwrap().kind,
+            kind(b"tEXt")
+        );
+        assert!(fast_walk(&image, first_idat, Some(expected_iend)).is_none());
+
+        let complete_walk = full_post_idat_walk(&image, first_idat);
+        assert!(complete_walk.reached_iend);
+        assert_eq!(complete_walk.records.len(), 1);
+        assert_eq!(complete_walk.records[0].record.body, "yes");
     }
 
     #[test]
