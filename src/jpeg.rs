@@ -112,6 +112,20 @@ mod tests {
         tiff
     }
 
+    fn le_tiff_image_description(description: &[u8]) -> Vec<u8> {
+        let mut value = description.to_vec();
+        value.push(0);
+        let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&0x010eu16.to_le_bytes());
+        tiff.extend_from_slice(&2u16.to_le_bytes());
+        tiff.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        tiff.extend_from_slice(&26u32.to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend_from_slice(&value);
+        tiff
+    }
+
     fn segment(marker: u8, data: &[u8]) -> Vec<u8> {
         let mut output = vec![0xff, marker];
         output.extend_from_slice(&((data.len() + 2) as u16).to_be_bytes());
@@ -146,6 +160,45 @@ mod tests {
         let scan = scan(&jpeg);
         assert!(scan.saw_exif);
         assert_eq!(scan.records[0].body, "parameters=late");
+    }
+
+    #[test]
+    fn fixture_15_reads_image_description_from_jpeg_exif() {
+        let mut exif = b"Exif\0\0".to_vec();
+        exif.extend_from_slice(&le_tiff_image_description(b"parameters=from-jpeg"));
+        let mut jpeg = b"\xff\xd8".to_vec();
+        jpeg.extend_from_slice(&segment(0xe1, &exif));
+        jpeg.extend_from_slice(b"\xff\xda");
+
+        let scan = scan(&jpeg);
+        assert_eq!(scan.records.len(), 1);
+        assert_eq!(scan.records[0].label, "EXIF ImageDescription");
+        assert_eq!(scan.records[0].body, "parameters=from-jpeg");
+    }
+
+    #[test]
+    fn jpeg_marker_fill_bytes_are_skipped_before_segment_lengths() {
+        let mut exif = b"Exif\0\0".to_vec();
+        exif.extend_from_slice(&be_tiff_user_comment(b"parameters=fill"));
+        let mut jpeg = b"\xff\xd8\xff".to_vec();
+        jpeg.extend_from_slice(&segment(0xe1, &exif)[1..]);
+        jpeg.extend_from_slice(b"\xff\xda");
+
+        let scan = scan(&jpeg);
+        assert_eq!(scan.records.len(), 1);
+        assert_eq!(scan.records[0].body, "parameters=fill");
+    }
+
+    #[test]
+    fn jpeg_stops_at_sos_before_payload_bytes_that_look_like_app1() {
+        let mut exif = b"Exif\0\0".to_vec();
+        exif.extend_from_slice(&be_tiff_user_comment(b"must-not-read"));
+        let mut jpeg = b"\xff\xd8\xff\xda".to_vec();
+        jpeg.extend_from_slice(&segment(0xe1, &exif));
+
+        let scan = scan(&jpeg);
+        assert!(!scan.saw_exif);
+        assert!(scan.records.is_empty());
     }
 
     #[test]
