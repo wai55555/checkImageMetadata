@@ -115,9 +115,11 @@ dependencies = [
 name = "fast_meta"
 version = "1.2.0"
 dependencies = [
+ "crc32fast",
  "flate2",
  "image",
  "kamadak-exif",
+ "memchr",
  "memmap2",
  "pocket-resources",
  "serde_json",
