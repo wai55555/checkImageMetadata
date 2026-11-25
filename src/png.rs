@@ -116,13 +116,14 @@ pub fn scan<'a>(bytes: &'a [u8], strict: bool) -> PngScan<'a> {
         };
     }
 
-    let (iend, probes, directly_after_idat) = find_connected_iend(bytes, stage_a.stop);
+    let (iend, probes, directly_after_idat, last_idat) = find_connected_iend(bytes, stage_a.stop);
     stats.idat_header_probes += probes;
     stats.iend_offset = iend;
 
     let mut post_idat = Vec::new();
     let mut resolved = directly_after_idat;
-    let mut chain_progress = reverse_chain_if_needed(bytes, first_idat, iend, directly_after_idat);
+    let mut chain_progress =
+        reverse_chain_if_needed(bytes, first_idat, iend, directly_after_idat, last_idat);
     if !directly_after_idat {
         if let Some(progress) = chain_progress.as_ref() {
             if let Some(chain) = progress.finish(bytes) {
@@ -584,11 +585,26 @@ fn read_bounded<R: Read>(reader: R) -> Option<Vec<u8>> {
     }
 }
 
-fn find_connected_iend(bytes: &[u8], start: usize) -> (Option<usize>, usize, bool) {
+fn find_connected_iend(bytes: &[u8], start: usize) -> (Option<usize>, usize, bool, Option<usize>) {
     let search_start = bytes.len().saturating_sub(IEND_SEARCH_LIMIT);
+    let terminal_candidate = if bytes.len() >= IEND.len() && bytes.ends_with(IEND) {
+        Some(bytes.len() - IEND.len())
+    } else {
+        None
+    };
+    let mut probes = 0usize;
+    if let Some(candidate) = terminal_candidate {
+        let (reached, count, no_post_idat_chunks, last_idat) =
+            connect_to_iend(bytes, start, candidate);
+        probes = probes.saturating_add(count);
+        if reached {
+            return (Some(candidate), probes, no_post_idat_chunks, last_idat);
+        }
+    }
+
     let mut candidates = Vec::new();
-    if bytes.len() >= IEND.len() && bytes.ends_with(IEND) {
-        candidates.push(bytes.len() - IEND.len());
+    if let Some(candidate) = terminal_candidate {
+        candidates.push(candidate);
     }
     if let Some(window) = bytes.get(search_start..) {
         for type_offset in memmem::find_iter(window, b"IEND") {
@@ -623,25 +639,33 @@ fn find_connected_iend(bytes: &[u8], start: usize) -> (Option<usize>, usize, boo
     }
     ordered.extend(rest);
     ordered.truncate(16);
-    let mut probes: usize = 0;
     for candidate in ordered {
-        let (reached, count, no_post_idat_chunks) = connect_to_iend(bytes, start, candidate);
+        if Some(candidate) == terminal_candidate {
+            continue;
+        }
+        let (reached, count, no_post_idat_chunks, last_idat) =
+            connect_to_iend(bytes, start, candidate);
         probes = probes.saturating_add(count);
         if reached {
             // Stage B can prove absence immediately when the final IDAT ends
             // exactly at the connected IEND. The ordinary reverse chain is
             // unnecessary in that case.
-            return (Some(candidate), probes, no_post_idat_chunks);
+            return (Some(candidate), probes, no_post_idat_chunks, last_idat);
         }
     }
-    (None, probes, false)
+    (None, probes, false, None)
 }
 
-fn connect_to_iend(bytes: &[u8], start: usize, target: usize) -> (bool, usize, bool) {
+fn connect_to_iend(
+    bytes: &[u8],
+    start: usize,
+    target: usize,
+) -> (bool, usize, bool, Option<usize>) {
     let mut cursor = start;
     let mut probes = 0usize;
     let mut non_idat_since_last_idat = false;
     let mut saw_idat = false;
+    let mut last_idat = None;
     while cursor <= target {
         if cursor == target {
             return (
@@ -651,30 +675,32 @@ fn connect_to_iend(bytes: &[u8], start: usize, target: usize) -> (bool, usize, b
                     == Some(IEND.as_slice()),
                 probes,
                 !non_idat_since_last_idat && saw_idat,
+                last_idat,
             );
         }
         let Some(chunk) = chunk_at(bytes, cursor) else {
-            return (false, probes, false);
+            return (false, probes, false, last_idat);
         };
         if chunk.offset > target || chunk.end > target {
-            return (false, probes, false);
+            return (false, probes, false, last_idat);
         }
         if chunk.kind == kind(b"IEND") {
-            return (false, probes, false);
+            return (false, probes, false, last_idat);
         }
         if chunk.kind == kind(b"IDAT") {
             probes = probes.saturating_add(1);
             saw_idat = true;
             non_idat_since_last_idat = false;
             if probes > MAX_IDAT_JUMPS {
-                return (false, probes, false);
+                return (false, probes, false, last_idat);
             }
+            last_idat = Some(chunk.offset);
         } else if saw_idat {
             non_idat_since_last_idat = true;
         }
         cursor = chunk.end;
     }
-    (false, probes, false)
+    (false, probes, false, last_idat)
 }
 
 struct Chain<'a> {
@@ -732,11 +758,17 @@ fn reverse_chain_if_needed(
     first_idat: usize,
     iend: Option<usize>,
     directly_after_idat: bool,
+    last_idat: Option<usize>,
 ) -> Option<ChainProgress> {
     if directly_after_idat {
         None
     } else {
-        iend.map(|iend_at| reverse_chain(bytes, first_idat, iend_at, INITIAL_WINDOW))
+        iend.and_then(|iend_at| {
+            let last_idat = last_idat?;
+            let window_start = iend_at.saturating_sub(INITIAL_WINDOW).max(first_idat);
+            (last_idat >= window_start)
+                .then(|| reverse_chain(bytes, first_idat, iend_at, INITIAL_WINDOW))
+        })
     }
 }
 
@@ -1499,10 +1531,31 @@ mod tests {
         let image = png(&[chunk(b"IDAT", &[1], true)]);
         let stage = stage_a(&image);
         let first_idat = stage.first_idat.unwrap();
-        let (iend, _, directly_after_idat) = find_connected_iend(&image, stage.stop);
+        let (iend, _, directly_after_idat, last_idat) = find_connected_iend(&image, stage.stop);
 
         assert!(directly_after_idat);
-        assert!(reverse_chain_if_needed(&image, first_idat, iend, directly_after_idat).is_none());
+        assert!(
+            reverse_chain_if_needed(&image, first_idat, iend, directly_after_idat, last_idat)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn large_last_idat_outside_reverse_window_uses_forward_fallback() {
+        let idat = chunk(b"IDAT", &vec![0x42; INITIAL_WINDOW + 1], true);
+        let workflow = text(b"workflow", b"after large IDAT");
+        let image = png(&[idat, workflow]);
+        let stage = stage_a(&image);
+        let first_idat = stage.first_idat.unwrap();
+        let (iend, _, directly_after_idat, last_idat) = find_connected_iend(&image, stage.stop);
+
+        assert!(!directly_after_idat);
+        assert!(reverse_chain_if_needed(&image, first_idat, iend, false, last_idat).is_none());
+
+        let result = scan(&image, false);
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].body, "after large IDAT");
+        assert_eq!(result.stats.stage_c_step, Some(1));
     }
 
     #[test]

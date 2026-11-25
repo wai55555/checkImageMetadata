@@ -753,6 +753,8 @@ fn extract_universal_metadata<W: Write>(
         return extract_webp_metadata(&mmap, path, writer);
     }
     if mmap.len() >= 3 && &mmap[0..3] == &[0xFF, 0xD8, 0xFF] {
+        #[cfg(unix)]
+        let _ = mmap.advise(memmap2::Advice::Random);
         return extract_exif_metadata(&mmap, path, "JPEG", writer);
     }
 
