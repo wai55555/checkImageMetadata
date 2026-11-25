@@ -2,6 +2,7 @@
 //! prove the IEND connection from the tail, then escalate only when needed.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::io::Read;
 
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
@@ -624,13 +625,21 @@ fn extend_chain(
     follow_candidates(bytes, first_idat, &candidates, progress);
 }
 
-fn reverse_candidates(bytes: &[u8], low: usize, high: usize) -> Vec<Chunk> {
+struct ReverseCandidates {
+    by_end: HashMap<usize, Vec<Chunk>>,
+}
+
+fn reverse_candidates(bytes: &[u8], low: usize, high: usize) -> ReverseCandidates {
     if low >= high {
-        return Vec::new();
+        return ReverseCandidates {
+            by_end: HashMap::new(),
+        };
     }
     let start = low.max(8);
     let Some(range) = bytes.get(start..high) else {
-        return Vec::new();
+        return ReverseCandidates {
+            by_end: HashMap::new(),
+        };
     };
     let mut candidates = Vec::new();
     for known in KNOWN_TYPES {
@@ -653,7 +662,14 @@ fn reverse_candidates(bytes: &[u8], low: usize, high: usize) -> Vec<Chunk> {
     }
     candidates.sort_by_key(|chunk| chunk.offset);
     candidates.dedup_by_key(|chunk| chunk.offset);
-    candidates
+    let mut by_end = HashMap::new();
+    for candidate in candidates {
+        by_end
+            .entry(candidate.end)
+            .or_insert_with(Vec::new)
+            .push(candidate);
+    }
+    ReverseCandidates { by_end }
 }
 
 fn add_reverse_candidate(
@@ -676,7 +692,7 @@ fn add_reverse_candidate(
 fn follow_candidates(
     bytes: &[u8],
     first_idat: usize,
-    candidates: &[Chunk],
+    candidates: &ReverseCandidates,
     progress: &mut ChainProgress,
 ) {
     while !progress.reached_idat {
@@ -706,14 +722,17 @@ fn follow_candidates(
 
 fn predecessor_from_candidates(
     bytes: &[u8],
-    candidates: &[Chunk],
+    candidates: &ReverseCandidates,
     frontier: usize,
 ) -> (Option<Chunk>, bool) {
     let mut non_idat = None;
     let mut idat = None;
     let mut bad_crc = false;
+    let Some(candidates) = candidates.by_end.get(&frontier) else {
+        return (None, false);
+    };
     for &chunk in candidates {
-        if chunk.offset >= frontier || chunk.end != frontier {
+        if chunk.offset >= frontier {
             continue;
         }
         if chunk.kind == kind(b"IDAT") {
@@ -1237,6 +1256,26 @@ mod tests {
         let records = progress.partial_records(&image);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].record.body, "retained");
+    }
+
+    #[test]
+    fn reverse_candidates_are_indexed_by_chunk_end() {
+        let idat = chunk(b"IDAT", &[1], true);
+        let workflow = text(b"workflow", b"indexed");
+        let profile = chunk(b"iCCP", &[0x35; 8], true);
+        let image = png(&[idat, workflow.clone(), profile.clone()]);
+        let first_idat = 33;
+        let workflow_offset = first_idat + chunk(b"IDAT", &[1], true).len();
+        let workflow_end = workflow_offset + workflow.len();
+        let iend = image.len() - 12;
+
+        let candidates = reverse_candidates(&image, first_idat, iend);
+        let workflow_candidates = candidates.by_end.get(&workflow_end).unwrap();
+
+        assert!(workflow_candidates
+            .iter()
+            .any(|candidate| candidate.offset == workflow_offset));
+        assert!(!candidates.by_end.contains_key(&(workflow_end + 1)));
     }
 
     #[test]
