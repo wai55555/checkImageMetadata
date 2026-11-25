@@ -288,9 +288,21 @@ fn kind(bytes: &[u8; 4]) -> u32 {
 fn collect_chunk_records<'a>(bytes: &'a [u8], chunk: Chunk, output: &mut Vec<LocatedRecord<'a>>) {
     let data = chunk.data(bytes);
     match chunk.kind {
-        k if k == kind(b"tEXt") => append_record(output, chunk.offset, parse_text(data)),
-        k if k == kind(b"zTXt") => append_record(output, chunk.offset, parse_ztxt(data)),
-        k if k == kind(b"iTXt") => append_record(output, chunk.offset, parse_itxt(data)),
+        k if k == kind(b"tEXt") => append_record(
+            output,
+            chunk.offset,
+            set_text_detail(parse_text(data), "tEXt"),
+        ),
+        k if k == kind(b"zTXt") => append_record(
+            output,
+            chunk.offset,
+            set_text_detail(parse_ztxt(data), "zTXt"),
+        ),
+        k if k == kind(b"iTXt") => append_record(
+            output,
+            chunk.offset,
+            set_text_detail(parse_itxt(data), "iTXt"),
+        ),
         k if k == kind(b"eXIf") => {
             output.extend(
                 tiff::parse(data, Source::PngExif)
@@ -303,6 +315,16 @@ fn collect_chunk_records<'a>(bytes: &'a [u8], chunk: Chunk, output: &mut Vec<Loc
         }
         _ => {}
     }
+}
+
+fn set_text_detail<'a>(
+    record: Option<RecordView<'a>>,
+    detail: &'static str,
+) -> Option<RecordView<'a>> {
+    record.map(|mut record| {
+        record.detail = Some(Cow::Borrowed(detail));
+        record
+    })
 }
 
 fn append_record<'a>(
@@ -1197,6 +1219,26 @@ mod tests {
         let result = scan(&image, false);
         assert_eq!(result.records.len(), 1);
         assert_eq!(result.records[0].body, "parameters=post-idat-exif");
+    }
+
+    #[test]
+    fn fixture_36_deduplicates_matching_text_and_exif_records() {
+        let image = png(&[
+            text(b"parameters", b"same parameters"),
+            text(b"Description", b"intervening record"),
+            exif_user_comment(b"same parameters"),
+        ]);
+        let result = scan(&image, false);
+        let mut sink = crate::output::TextSink::default();
+        for record in result.records {
+            sink.push_record(record);
+        }
+        let mut output = Vec::new();
+        sink.flush(&mut output).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "--- Stable Diffusion (A1111) ---\nsame parameters\n(also in: png_exif UserComment)\n--- NovelAI [Prompt] ---\nintervening record\n"
+        );
     }
 
     #[test]
