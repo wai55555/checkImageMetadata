@@ -1,4 +1,5 @@
 pub mod output;
+pub mod keywords;
 pub mod record;
 
 use memmap2::MmapOptions;
@@ -7,16 +8,6 @@ use std::io::{self, Read};
 use std::str;
 use serde_json::Value;
 use flate2::read::{GzDecoder, ZlibDecoder};
-
-// 探す対象のキーワードリスト
-const TARGET_KEYWORDS: [&str; 6] = [
-    "parameters",      // SD (A1111)
-    "prompt",          // ComfyUI
-    "workflow",        // ComfyUI
-    "generation_data", // ComfyUI (rare case)
-    "Description",     // NovelAI (Prompt)
-    "Comment"          // NovelAI (Settings JSON)
-];
 
 // 最初のスキャン上限 (64KB)
 const FAST_SCAN_LIMIT: usize = 65536;
@@ -113,18 +104,18 @@ fn parse_png_chunk(chunk_type: &[u8], data: &[u8]) -> Result<bool, Box<dyn std::
     let mut meta_found = false;
     if chunk_type == b"tEXt" {
         if let Some(null_pos) = data.iter().position(|&b| b == 0) {
-            if let Ok(keyword) = str::from_utf8(&data[0..null_pos]) {
-                if TARGET_KEYWORDS.contains(&keyword) {
-                    let text = str::from_utf8(&data[null_pos+1..]).unwrap_or("");
-                    print_metadata(keyword, text)?;
+            if let Some(keyword) = keywords::lookup(&data[..null_pos]) {
+                if !keyword.xmp_packet {
+                    let text = str::from_utf8(&data[null_pos + 1..]).unwrap_or("");
+                    print_metadata(keyword.name, text)?;
                     meta_found = true;
                 }
             }
         }
     } else if chunk_type == b"iTXt" {
         if let Some(null_pos) = data.iter().position(|&b| b == 0) {
-            if let Ok(keyword) = str::from_utf8(&data[0..null_pos]) {
-                if TARGET_KEYWORDS.contains(&keyword) {
+            if let Some(keyword) = keywords::lookup(&data[..null_pos]) {
+                if !keyword.xmp_packet {
                     if null_pos + 2 < data.len() {
                         let comp_flag = data[null_pos + 1];
                         // ヌル終端の lang_tag と trans_key を飛ばす
@@ -139,13 +130,13 @@ fn parse_png_chunk(chunk_type: &[u8], data: &[u8]) -> Result<bool, Box<dyn std::
                                     let mut decoder = ZlibDecoder::new(text_bytes);
                                     let mut decoded_text = String::new();
                                     if decoder.read_to_string(&mut decoded_text).is_ok() {
-                                        print_metadata(keyword, &decoded_text)?;
+                                        print_metadata(keyword.name, &decoded_text)?;
                                         meta_found = true;
                                     }
                                 } else {
                                     // 非圧縮
                                     if let Ok(text) = str::from_utf8(text_bytes) {
-                                        print_metadata(keyword, text)?;
+                                        print_metadata(keyword.name, text)?;
                                         meta_found = true;
                                     }
                                 }
@@ -466,27 +457,21 @@ fn extract_webp_metadata(mmap: &[u8], path: &str) -> Result<(), Box<dyn std::err
 }
 
 fn print_metadata(keyword: &str, text: &str) -> Result<(), Box<dyn std::error::Error>> {
-    match keyword {
-        "Description" => {
-            println!("--- NovelAI [Prompt] ---");
-            println!("{}", text);
-        },
-        "Comment" => {
-            println!("--- NovelAI [Settings] ---");
-            if let Ok(v) = serde_json::from_str::<Value>(text) {
-                println!("{}", serde_json::to_string_pretty(&v)?);
-            } else {
-                println!("{}", text);
-            }
-        },
-        "parameters" => {
-            println!("--- Stable Diffusion (A1111) ---");
-            println!("{}", text);
-        },
-        _ => {
-            println!("--- {} ---", keyword);
+    let Some(definition) = keywords::lookup(keyword.as_bytes()) else {
+        return Ok(());
+    };
+    if definition.xmp_packet {
+        return Ok(());
+    }
+    println!("--- {} ---", definition.label);
+    if definition.json_settings {
+        if let Ok(value) = serde_json::from_str::<Value>(text) {
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
             println!("{}", text);
         }
+    } else {
+        println!("{}", text);
     }
     Ok(())
 }
