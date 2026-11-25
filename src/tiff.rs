@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 use crate::record::{RecordView, Source};
 
@@ -41,6 +42,12 @@ struct IfdEntry {
     value_field_offset: usize,
 }
 
+struct IfdView {
+    entries_start: usize,
+    entry_count: usize,
+    next_ifd: u32,
+}
+
 impl<'a> TiffReader<'a> {
     fn new(bytes: &'a [u8]) -> Option<Self> {
         if bytes.len() > MAX_EXIF_BYTES {
@@ -65,11 +72,11 @@ impl<'a> TiffReader<'a> {
         })
     }
 
-    fn ifd0(&self) -> Option<(usize, usize, usize)> {
+    fn ifd0(&self) -> Option<IfdView> {
         self.ifd(self.ifd0_offset)
     }
 
-    fn ifd(&self, offset: u32) -> Option<(usize, usize, usize)> {
+    fn ifd(&self, offset: u32) -> Option<IfdView> {
         let start = usize::try_from(offset).ok()?;
         let count_end = start.checked_add(2)?;
         let count = usize::from(
@@ -83,7 +90,11 @@ impl<'a> TiffReader<'a> {
         let next_ifd = self
             .byte_order
             .u32(self.bytes.get(next_offset..next_end)?.try_into().ok()?);
-        Some((entries_start, count, usize::try_from(next_ifd).ok()?))
+        Some(IfdView {
+            entries_start,
+            entry_count: count,
+            next_ifd,
+        })
     }
 
     fn entry(&self, entries_start: usize, index: usize) -> Option<IfdEntry> {
@@ -107,9 +118,9 @@ impl<'a> TiffReader<'a> {
             _ => return None,
         };
         let value_len = type_size.checked_mul(usize::try_from(entry.count).ok()?)?;
-        // D-07 adds support for values stored inline in the four-byte field.
         if value_len <= 4 {
-            return None;
+            let value_field_end = entry.value_field_offset.checked_add(value_len)?;
+            return self.bytes.get(entry.value_field_offset..value_field_end);
         }
         let value_field_end = entry.value_field_offset.checked_add(4)?;
         let value_offset = self.byte_order.u32(
@@ -128,14 +139,51 @@ pub fn parse<'a>(bytes: &'a [u8], source: Source) -> Vec<RecordView<'a>> {
     let Some(reader) = TiffReader::new(bytes) else {
         return Vec::new();
     };
-    let Some((entries_start, entry_count, _)) = reader.ifd0() else {
+    let Some(ifd0) = reader.ifd0() else {
         return Vec::new();
     };
     let mut records = Vec::new();
-    for index in 0..entry_count {
-        let Some(entry) = reader.entry(entries_start, index) else {
-            break;
-        };
+    let mut visited = HashSet::new();
+    let next_ifd = parse_ifd(
+        &reader,
+        reader.ifd0_offset,
+        source,
+        true,
+        0,
+        &mut visited,
+        &mut records,
+    )
+    .unwrap_or(ifd0.next_ifd);
+    if next_ifd != 0 {
+        let _ = parse_ifd(
+            &reader,
+            next_ifd,
+            source,
+            false,
+            0,
+            &mut visited,
+            &mut records,
+        );
+    }
+    records
+}
+
+fn parse_ifd<'a>(
+    reader: &TiffReader<'a>,
+    offset: u32,
+    source: Source,
+    follow_exif: bool,
+    depth: usize,
+    visited: &mut HashSet<u32>,
+    records: &mut Vec<RecordView<'a>>,
+) -> Option<u32> {
+    if !visited.insert(offset) {
+        return Some(0);
+    }
+    let ifd = reader.ifd(offset)?;
+    let mut exif_offsets = Vec::new();
+    for index in 0..ifd.entry_count {
+        let entry = reader.entry(ifd.entries_start, index)?;
         if entry.tag == USER_COMMENT {
             if let Some(data) = reader.value(entry) {
                 if let Some(body) = decode_initial_user_comment(data) {
@@ -149,8 +197,30 @@ pub fn parse<'a>(bytes: &'a [u8], source: Source) -> Vec<RecordView<'a>> {
                 }
             }
         }
+        if follow_exif && entry.tag == 0x8769 && entry.field_type == 4 && entry.count == 1 {
+            if let Some(value) = reader.value(entry) {
+                if let Ok(bytes) = <[u8; 4]>::try_from(value) {
+                    exif_offsets.push(reader.byte_order.u32(bytes));
+                }
+            }
+        }
     }
-    records
+    if follow_exif && depth < 4 {
+        for exif_offset in exif_offsets {
+            if exif_offset != 0 {
+                let _ = parse_ifd(
+                    reader,
+                    exif_offset,
+                    source,
+                    true,
+                    depth + 1,
+                    visited,
+                    records,
+                );
+            }
+        }
+    }
+    Some(ifd.next_ifd)
 }
 
 fn decode_initial_user_comment(data: &[u8]) -> Option<Cow<'_, str>> {
@@ -173,7 +243,17 @@ fn decode_initial_user_comment(data: &[u8]) -> Option<Cow<'_, str>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ByteOrder, TiffReader};
+    use super::{parse, ByteOrder, TiffReader};
+    use crate::record::Source;
+
+    fn entry(tag: u16, field_type: u16, count: u32, value: [u8; 4]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&field_type.to_le_bytes());
+        bytes.extend_from_slice(&count.to_le_bytes());
+        bytes.extend_from_slice(&value);
+        bytes
+    }
 
     #[test]
     fn phase2_tiff_header_accepts_little_and_big_endian() {
@@ -186,5 +266,58 @@ mod tests {
         assert_eq!(TiffReader::new(big).unwrap().byte_order, ByteOrder::Big);
         assert!(TiffReader::new(b"ZZ\0*\0\0\0\x08").is_none());
         assert!(TiffReader::new(b"II\0\0\0\0\0\x08").is_none());
+    }
+
+    #[test]
+    fn fixture_16_reads_inline_user_comment() {
+        let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&entry(0x9286, 7, 4, *b"test"));
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+
+        let records = parse(&tiff, Source::JpegExif);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].body, "test");
+    }
+
+    #[test]
+    fn tiff_follows_exif_ifd_before_ifd1_and_does_not_follow_nested_next_ifd() {
+        let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&entry(0x8769, 4, 1, 26u32.to_le_bytes()));
+        tiff.extend_from_slice(&58u32.to_le_bytes());
+
+        // ExifIFD at 26 has an out-of-order UserComment and a nonzero next IFD.
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&entry(0x9286, 7, 14, 44u32.to_le_bytes()));
+        tiff.extend_from_slice(&76u32.to_le_bytes());
+        tiff.extend_from_slice(b"ASCII\0\0\0nested");
+
+        // IFD1 contains another visible UserComment and must be visited after ExifIFD.
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&entry(0x9286, 7, 4, *b"IFD1"));
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        // The ExifIFD next pointer points here, but that IFD must not be followed.
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&entry(0x9286, 7, 4, *b"skip"));
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+
+        let records = parse(&tiff, Source::JpegExif);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].body, "nested");
+        assert_eq!(records[1].body, "IFD1");
+    }
+
+    #[test]
+    fn tiff_visited_offsets_prevent_exif_cycles() {
+        let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+        tiff.extend_from_slice(&2u16.to_le_bytes());
+        tiff.extend_from_slice(&entry(0x9286, 7, 4, *b"once"));
+        tiff.extend_from_slice(&entry(0x8769, 4, 1, 8u32.to_le_bytes()));
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+
+        let records = parse(&tiff, Source::JpegExif);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].body, "once");
     }
 }
