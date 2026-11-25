@@ -169,6 +169,19 @@ fn stealth_png_variant_with_max_height(
     png
 }
 
+fn png_with_trailing_json() -> Vec<u8> {
+    let mut png = PNG_SIGNATURE.to_vec();
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&1u32.to_be_bytes());
+    ihdr.extend_from_slice(&1u32.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    png.extend_from_slice(&png_chunk(b"IHDR", &ihdr));
+    png.extend_from_slice(&png_chunk(b"IDAT", &compress(&[0, 0, 0, 0, 0])));
+    png.extend_from_slice(&png_chunk(b"IEND", &[]));
+    png.extend_from_slice(br#"{"prompt":"trailing only"}"#);
+    png
+}
+
 fn corrupt_idat_zlib_checksum(mut png: Vec<u8>) -> Vec<u8> {
     let mut cursor = PNG_SIGNATURE.len();
     loop {
@@ -341,4 +354,14 @@ fn stealth_never_skips_the_stealth_scan() {
     assert!(output.contains("(No metadata detected)"));
     assert!(!output.contains("Stealth PNG Info"));
     assert!(!output.contains("must be skipped"));
+}
+
+#[test]
+fn trailing_only_png_does_not_also_report_no_metadata() {
+    let png = TempPng::new(&png_with_trailing_json());
+    let output = run_cli(&[png.path.to_str().unwrap()]);
+
+    assert!(output.contains("--- Trailing Data (after IEND) ---"));
+    assert!(output.contains(r#"{"prompt":"trailing only"}"#));
+    assert!(!output.contains("(No metadata detected)"));
 }

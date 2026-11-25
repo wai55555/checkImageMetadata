@@ -56,9 +56,10 @@ fn extract_png_metadata(
             detail: Some(std::borrow::Cow::Owned(format!("{mode}/{signature}"))),
         });
     }
+    let has_any_metadata_record = !sink.is_empty();
     sink.flush(&mut io::stdout().lock())?;
 
-    if !has_normal_metadata && stealth_result.is_none() {
+    if !has_any_metadata_record {
         println!("(No metadata detected)");
     }
 
