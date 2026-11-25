@@ -14,5 +14,7 @@ All three contain no metadata. The test observed 3/3 Stage B resolutions and
 these results; they are stage-path measurements, not wall-clock performance
 measurements.
 
-Phase 0's five CLI goldens were also run against the Phase 1 implementation:
-all five passed. The ComfyUI golden retains its legacy scan notice and output.
+Phase 0's five reproducible CLI goldens are in
+[`tests/golden_cli.rs`](../tests/golden_cli.rs). They were run against the
+Phase 1 implementation and all five passed. The ComfyUI golden retains its
+legacy scan notice and output.
