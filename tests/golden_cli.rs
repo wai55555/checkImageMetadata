@@ -284,3 +284,16 @@ fn golden_unsupported_format_reports_error_and_exits_zero() {
         "Unsupported file format\n"
     );
 }
+
+#[test]
+fn golden_invokeai_legacy_dream_keyword() {
+    let png = simple_png(text_chunk(
+        "Dream",
+        "a cat -s 30 -S 123 -C 7 -A euler -W 512 -H 512",
+    ));
+    assert_cli_golden(
+        "png",
+        &png,
+        "=== PNG File: <fixture> ===\n--- InvokeAI (Legacy) ---\na cat -s 30 -S 123 -C 7 -A euler -W 512 -H 512\n",
+    );
+}
