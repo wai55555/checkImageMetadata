@@ -297,3 +297,16 @@ fn golden_invokeai_legacy_dream_keyword() {
         "=== PNG File: <fixture> ===\n--- InvokeAI (Legacy) ---\na cat -s 30 -S 123 -C 7 -A euler -W 512 -H 512\n",
     );
 }
+
+#[test]
+fn golden_easy_diffusion_marker_keyword() {
+    let png = simple_png(text_chunk(
+        "use_stable_diffusion_model",
+        "sd_xl_base_1.0",
+    ));
+    assert_cli_golden(
+        "png",
+        &png,
+        "=== PNG File: <fixture> ===\n--- Easy Diffusion ---\nsd_xl_base_1.0\n",
+    );
+}

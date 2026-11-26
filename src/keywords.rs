@@ -6,7 +6,7 @@ pub struct PngKeyword {
     pub xmp_packet: bool,
 }
 
-static PNG_KEYWORDS: [PngKeyword; 15] = [
+static PNG_KEYWORDS: [PngKeyword; 16] = [
     PngKeyword {
         name: "parameters",
         label: "Stable Diffusion (A1111)",
@@ -92,6 +92,12 @@ static PNG_KEYWORDS: [PngKeyword; 15] = [
         xmp_packet: false,
     },
     PngKeyword {
+        name: "use_stable_diffusion_model",
+        label: "Easy Diffusion",
+        json_settings: false,
+        xmp_packet: false,
+    },
+    PngKeyword {
         name: "XML:com.adobe.xmp",
         label: "XMP",
         json_settings: false,
@@ -122,7 +128,7 @@ mod tests {
             .map(|entry| entry.name.as_bytes())
             .collect();
         assert_eq!(registered, table);
-        assert_eq!(registered.len(), 15);
+        assert_eq!(registered.len(), 16);
 
         for (index, entry) in PNG_KEYWORDS.iter().enumerate() {
             assert_eq!(lookup(entry.name.as_bytes()), Some(*entry));
@@ -144,5 +150,9 @@ mod tests {
         assert_eq!(lookup(b"invokeai_metadata").unwrap().label, "InvokeAI");
         assert_eq!(lookup(b"sd-metadata").unwrap().label, "sd-metadata");
         assert_eq!(lookup(b"Dream").unwrap().label, "InvokeAI (Legacy)");
+        assert_eq!(
+            lookup(b"use_stable_diffusion_model").unwrap().label,
+            "Easy Diffusion"
+        );
     }
 }
