@@ -23,7 +23,7 @@ impl<'a> TextSink<'a> {
         self.records.is_empty()
     }
 
-    pub fn flush<W: Write>(&mut self, writer: &mut W) -> io::Result<()> {
+    pub fn flush<W: Write + ?Sized>(&mut self, writer: &mut W) -> io::Result<()> {
         let has_sd_metadata = self.records.iter().any(is_sd_metadata_record);
         if !has_sd_metadata {
             for record in &mut self.records {

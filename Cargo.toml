@@ -3,6 +3,14 @@ name = "fast_meta"
 version = "2.0.0"
 edition = "2021"
 
+[lib]
+name = "fast_meta"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fast_meta"
+path = "src/main.rs"
+
 [dependencies]
 memmap2 = "0.9"
 serde_json = "1.0"

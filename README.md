@@ -31,6 +31,43 @@ fast_meta [--strict] [--stealth <auto|always|never>] <image_file>
 
 Stealth PNG は非インターレースのカラータイプ 2 / 4 / 6、8bit / 16bit を対象とします。Adam7 インターレースには対応していません。
 
+## ライブラリとして使う
+
+`fast_meta` は CLI とライブラリの両方を提供します。レコードは mmap の生存期間内に
+コールバックで渡されるため、保持する場合は `on_record` の中で所有化してください。
+
+```toml
+[dependencies]
+fast_meta = { git = "https://github.com/wai55555/checkImageMetadata", tag = "v2.1.0" }
+```
+
+```rust
+use fast_meta::{scan_file, RecordSink, RecordView, ScanOptions};
+
+struct PrintSink;
+
+impl RecordSink for PrintSink {
+    fn on_record(&mut self, record: &RecordView<'_>) {
+        println!("{}: {}", record.label, record.body);
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let outcome = scan_file(
+        std::path::Path::new("image.png"),
+        &ScanOptions::default(),
+        &mut PrintSink,
+    )?;
+    if outcome.format.is_none() {
+        eprintln!("unsupported format");
+    }
+    Ok(())
+}
+```
+
+`scan_file` の戻り値が `Ok` で `format == None` の場合は未対応形式です。
+入出力エラーは `Err(ScanError::Io(..))` で返ります。
+
 ## サイズ上限
 
 - `tEXt` 本文: 明示的な上限なし
