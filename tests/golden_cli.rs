@@ -269,3 +269,18 @@ fn golden_webp_xmp_description_element() {
         "=== WebP File: <fixture> ===\n--- Midjourney (XMP) ---\na WebP prompt\n",
     );
 }
+
+#[test]
+fn golden_unsupported_format_reports_error_and_exits_zero() {
+    let fixture = TempFixture::new("bin", b"not an image");
+    let output = Command::new(env!("CARGO_BIN_EXE_fast_meta"))
+        .arg(&fixture.path)
+        .output()
+        .expect("run fast_meta");
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("CLI stderr is UTF-8"),
+        "Unsupported file format\n"
+    );
+}
