@@ -935,8 +935,27 @@ fn webp_records(mmap: &[u8]) -> Vec<record::RecordView<'_>> {
     if mmap.get(..4) != Some(b"RIFF") || mmap.get(8..12) != Some(b"WEBP") {
         return Vec::new();
     }
+    // REQ-EXT-08: RIFF サイズを読み、そのペイロードの範囲内だけを歩く。
+    // 範囲外（末尾に付いたデータ等）に EXIF／XMP 形状のバイト列があっても拾わない。
+    let Some(riff_size_bytes) = mmap.get(4..8) else {
+        return Vec::new();
+    };
+    let Ok(riff_size_bytes) = <[u8; 4]>::try_from(riff_size_bytes) else {
+        return Vec::new();
+    };
+    let riff_size = u32::from_le_bytes(riff_size_bytes) as usize;
+    // "RIFF" + size(4) + size バイト = 論理的な終端。
+    // サイズが 0 またはファイル長を超える（壊れた／切り詰められた）場合は
+    // 「不明」として従来どおり実ファイル長まで歩く。既存の許容
+    // （サイズ 0 でもチャンクを読む）を退行させないための判断で、
+    // 宣言されたサイズが妥当なときに範囲外を読まないことが本要件の主眼。
+    let declared_end = 8usize.checked_add(riff_size);
+    let riff_end = match declared_end {
+        Some(end) if riff_size != 0 && end <= mmap.len() => end,
+        _ => mmap.len(),
+    };
     let mut cursor = 12usize;
-    let len = mmap.len();
+    let len = riff_end;
     let mut records = Vec::new();
     while let Some(header_end) = cursor.checked_add(8) {
         if header_end > len {
@@ -964,7 +983,12 @@ fn webp_records(mmap: &[u8]) -> Vec<record::RecordView<'_>> {
         }
 
         if chunk_type == b"EXIF" {
-            let exif_data = &mmap[data_start..data_end];
+            let mut exif_data = &mmap[data_start..data_end];
+            // REQ-EXT-16: WebP の EXIF チャンクは先頭に `Exif\0\0` が付くことがある。
+            // TIFF パーサはそのままだと 0 件になるため読み飛ばす（無い場合は従来どおり）。
+            if let Some(rest) = exif_data.strip_prefix(b"Exif\0\0") {
+                exif_data = rest;
+            }
             records.extend(tiff::parse(exif_data, record::Source::WebpExif));
         } else if chunk_type == b"XMP " {
             records.extend(xmp::parse(
@@ -1094,6 +1118,54 @@ mod webp_tests {
         image.extend_from_slice(&(body.len() as u32).to_le_bytes());
         image.extend_from_slice(&body);
         image
+    }
+
+    /// T-38（REQ-EXT-16）: `Exif\0\0` プレフィクス付きの EXIF チャンクから読める。
+    #[test]
+    fn t38_reads_webp_exif_chunk_with_exif_prefix() {
+        let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&0x9286u16.to_le_bytes());
+        tiff.extend_from_slice(&7u16.to_le_bytes());
+        let comment = b"ASCII\0\0\0prefixed";
+        tiff.extend_from_slice(&(comment.len() as u32).to_le_bytes());
+        tiff.extend_from_slice(&26u32.to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend_from_slice(comment);
+        let mut payload = b"Exif\0\0".to_vec();
+        payload.extend_from_slice(&tiff);
+
+        let image = webp(&[webp_chunk(b"EXIF", &payload)]);
+        let records = webp_records(&image);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].body, "prefixed");
+    }
+
+    /// T-18（REQ-EXT-08）: RIFF ペイロードの外側にある EXIF／XMP 形状のバイト列は拾わない。
+    #[test]
+    fn t18_ignores_chunk_like_bytes_after_the_riff_payload() {
+        let packet = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description xmlns:d='http://purl.org/dc/elements/1.1/'><d:description>inside</d:description></rdf:Description></rdf:RDF></x:xmpmeta>";
+        let mut image = webp(&[webp_chunk(b"XMP ", packet)]);
+        // RIFF の外側に、同じ形の XMP チャンクを後置する。
+        image.extend_from_slice(&webp_chunk(b"XMP ", b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description xmlns:d='http://purl.org/dc/elements/1.1/'><d:description>outside</d:description></rdf:Description></rdf:RDF></x:xmpmeta>"));
+        let records = webp_records(&image);
+        let bodies: Vec<&str> = records.iter().map(|record| record.body.as_ref()).collect();
+        assert_eq!(bodies, ["inside"]);
+    }
+
+    /// T-39（REQ-EXT-05(b)）: チャンクサイズ不正で歩行を止めても、
+    /// それまでに得たレコードは捨てずに返す。
+    #[test]
+    fn t39_webp_returns_records_before_an_invalid_chunk_size() {
+        let packet = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description xmlns:d='http://purl.org/dc/elements/1.1/'><d:description>kept</d:description></rdf:Description></rdf:RDF></x:xmpmeta>";
+        let mut image = webp(&[webp_chunk(b"XMP ", packet)]);
+        // 不正なチャンクサイズ（ファイル長を超える）を後置する。
+        image.extend_from_slice(b"EXIF");
+        image.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let records = webp_records(&image);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].body, "kept");
     }
 
     #[test]

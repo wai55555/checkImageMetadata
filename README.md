@@ -33,6 +33,18 @@ fast_meta [--strict] [--stealth <auto|always|never>] <image_file>
 
 Stealth PNG は非インターレースのカラータイプ 2 / 4 / 6、8bit / 16bit を対象とします。Adam7 インターレースには対応していません。
 
+## 抽出の堅牢性（2.3.0）
+
+- 壊れた1単位（TIFF のエントリ、PNG のチャンク、XMP の局所破損）が、後ろにある本物の
+  メタデータを落とさない（fail-soft）。
+- PNG の最終手段（Stage C step 4）で、IEND 到達も CRC の接続証明も無いまま得たレコードは
+  `Source::PngUnproven` として隔離する。分類側では「弱い証拠」として扱い、単独では
+  確定に使わないこと（`Source::Trailing` と同じ扱い）。
+- XMP は UTF-16（BOM 付き BE／LE）のパケットも読む（UTF-32 は対象外）。局所破損があっても
+  破損前のフィールドは返し、複数の `rdf:Description` がある場合は主対象
+  （`rdf:about=""`）のフィールドを優先する。
+- WebP は RIFF サイズの範囲内だけを歩き、`Exif\0\0` プレフィクス付きの EXIF も読む。
+
 ## ライブラリとして使う
 
 `fast_meta` は CLI とライブラリの両方を提供します。レコードは mmap の生存期間内に
@@ -74,10 +86,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 - `tEXt` 本文: 明示的な上限なし
 - `zTXt` / 圧縮 `iTXt`: 解凍後 64 MB / チャンク
-- XMP パケット: 16 MB
-- EXIF ブロック: 16 MB
+- XMP パケット: 16 MB（REQ-EXT-12: 資源保護のため維持する仕様。上限超過のパケットは
+  「その担体が 0 件」になる。切り捨てて部分的に読む方式は、構造検証ができず
+  fail-open を招くため採用しない）
+- EXIF ブロック: 16 MB（同上）
 - Stealth PNG: 最大寸法 16,384、解凍後 512 MB、ペイロード 8 MB、IDAT 合計 512 MB
 - IEND 後の trailing data: 先頭 1 MB を走査
+
+## 未実装（既知の制限）
+
+- **C2PA**: 実装していません。`Source::C2pa` は enum の予約に留まり、C2PA の生成宣言
+  （`trainedAlgorithmicMedia` 等）だけを持つ画像は、現行ではどのレコードも生成されません
+  （分類は空振りする）。対応済みと誤認させる表示は行いません。
+- **PNG の 16 MB 超 XMP／EXIF**: 上記のとおり 0 件（仕様）。
 
 ## ビルド
 
