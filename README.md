@@ -86,10 +86,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 - `tEXt` 本文: 明示的な上限なし
 - `zTXt` / 圧縮 `iTXt`: 解凍後 64 MB / チャンク
-- XMP パケット: 16 MB
-- EXIF ブロック: 16 MB
+- XMP パケット: 16 MB（REQ-EXT-12: 資源保護のため維持する仕様。上限超過のパケットは
+  「その担体が 0 件」になる。切り捨てて部分的に読む方式は、構造検証ができず
+  fail-open を招くため採用しない）
+- EXIF ブロック: 16 MB（同上）
 - Stealth PNG: 最大寸法 16,384、解凍後 512 MB、ペイロード 8 MB、IDAT 合計 512 MB
 - IEND 後の trailing data: 先頭 1 MB を走査
+
+## 未実装（既知の制限）
+
+- **C2PA**: 実装していません。`Source::C2pa` は enum の予約に留まり、C2PA の生成宣言
+  （`trainedAlgorithmicMedia` 等）だけを持つ画像は、現行ではどのレコードも生成されません
+  （分類は空振りする）。対応済みと誤認させる表示は行いません。
+- **PNG の 16 MB 超 XMP／EXIF**: 上記のとおり 0 件（仕様）。
 
 ## ビルド
 

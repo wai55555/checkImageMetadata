@@ -6,6 +6,8 @@ use std::borrow::Cow;
 
 use crate::record::{RecordView, Source};
 
+/// REQ-EXT-12: XMP パケットのハード上限。資源保護のため維持する。上限超過は 0 件
+/// （切り捨てて部分的に読むと構造検証ができず fail-open になるため）。
 pub const XMP_PACKET_LIMIT: usize = 16 * 1024 * 1024;
 
 const NS_DC: &str = "http://purl.org/dc/elements/1.1/";
@@ -1060,6 +1062,14 @@ mod tests {
             .find(|record| record.keyword.as_deref() == Some("CreatorTool"))
             .expect("CreatorTool record");
         assert_eq!(creator.body, "OtherTool");
+    }
+
+    /// T-30（REQ-EXT-12）: 16MB を超える XMP パケットは 0 件（資源保護のための仕様）。
+    #[test]
+    fn t30_xmp_packet_over_the_16mb_limit_yields_no_records() {
+        let mut packet = vec![b' '; super::XMP_PACKET_LIMIT + 1];
+        packet[..5].copy_from_slice(b"<?xml");
+        assert!(parse_packet(&packet, Source::PngXmp).records.is_empty());
     }
 
     /// T-29（REQ-EXT-11）: 局所破損（終端の無いコメント）があっても、
