@@ -4,6 +4,9 @@ use std::collections::HashSet;
 use crate::record::{RecordView, Source};
 use crate::xmp;
 
+/// REQ-EXT-12: EXIF／TIFF パケットのハード上限。資源保護のため維持する。
+/// 上限超過のパケットは「0 件」として扱う（切り捨てて部分的に読まない。
+/// 切り捨てた TIFF は構造検証ができず、fail-open を招くため）。
 const MAX_EXIF_BYTES: usize = 16 * 1024 * 1024;
 const USER_COMMENT: u16 = 0x9286;
 const IMAGE_DESCRIPTION: u16 = 0x010e;
@@ -455,8 +458,8 @@ fn trim_trailing_nuls(mut text: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse, ByteOrder, TiffReader, Utf16Order, ARTIST, IMAGE_DESCRIPTION, MAKE, MAX_IFD_CHAIN,
-        MODEL, SOFTWARE, USER_COMMENT, XP_COMMENT,
+        parse, ByteOrder, TiffReader, Utf16Order, ARTIST, IMAGE_DESCRIPTION, MAKE, MAX_EXIF_BYTES,
+        MAX_IFD_CHAIN, MODEL, SOFTWARE, USER_COMMENT, XP_COMMENT,
     };
     use crate::record::Source;
 
@@ -574,6 +577,14 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].body, "nested");
         assert_eq!(records[1].body, "IFD1");
+    }
+
+    /// T-30（REQ-EXT-12）: 16MB を超える EXIF パケットは 0 件（資源保護のための仕様）。
+    #[test]
+    fn t30_tiff_packet_over_the_16mb_limit_yields_no_records() {
+        let mut packet = vec![0u8; MAX_EXIF_BYTES + 1];
+        packet[..4].copy_from_slice(b"II*\0");
+        assert!(parse(&packet, Source::JpegExif).is_empty());
     }
 
     #[test]
