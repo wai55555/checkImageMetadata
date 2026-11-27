@@ -290,33 +290,15 @@ fn kind(bytes: &[u8; 4]) -> u32 {
 fn collect_chunk_records<'a>(bytes: &'a [u8], chunk: Chunk, output: &mut Vec<LocatedRecord<'a>>) {
     let data = chunk.data(bytes);
     match chunk.kind {
-        k if k == kind(b"tEXt") => append_record(
-            output,
-            chunk.offset,
-            set_text_detail(parse_text(data), "tEXt"),
-        ),
-        k if k == kind(b"zTXt") => append_record(
-            output,
-            chunk.offset,
-            set_text_detail(parse_ztxt(data), "zTXt"),
-        ),
-        k if k == kind(b"iTXt") => match parse_itxt(data) {
-            ItxtRecords::Text(record) => {
-                append_record(output, chunk.offset, set_text_detail(record, "iTXt"))
-            }
-            ItxtRecords::Xmp(records) => {
-                output.extend(
-                    records
-                        .into_iter()
-                        .enumerate()
-                        .map(|(record_index, record)| LocatedRecord {
-                            offset: chunk.offset,
-                            record_index,
-                            record,
-                        }),
-                );
-            }
-        },
+        k if k == kind(b"tEXt") => {
+            append_text_records(output, chunk.offset, parse_text(data), "tEXt")
+        }
+        k if k == kind(b"zTXt") => {
+            append_text_records(output, chunk.offset, parse_ztxt(data), "zTXt")
+        }
+        k if k == kind(b"iTXt") => {
+            append_text_records(output, chunk.offset, parse_itxt(data), "iTXt")
+        }
         k if k == kind(b"eXIf") => {
             output.extend(
                 tiff::parse(data, Source::PngExif)
@@ -330,6 +312,28 @@ fn collect_chunk_records<'a>(bytes: &'a [u8], chunk: Chunk, output: &mut Vec<Loc
             );
         }
         _ => {}
+    }
+}
+
+/// REQ-EXT-06: テキストチャンクの種別（tEXt／zTXt／iTXt）で委譲先を変えない。
+fn append_text_records<'a>(
+    output: &mut Vec<LocatedRecord<'a>>,
+    offset: usize,
+    records: TextRecords<'a>,
+    detail: &'static str,
+) {
+    match records {
+        TextRecords::Text(record) => append_record(output, offset, set_text_detail(record, detail)),
+        TextRecords::Xmp(records) => output.extend(
+            records
+                .into_iter()
+                .enumerate()
+                .map(|(record_index, record)| LocatedRecord {
+                    offset,
+                    record_index,
+                    record,
+                }),
+        ),
     }
 }
 
@@ -357,11 +361,31 @@ fn append_record<'a>(
     }
 }
 
-fn text_record<'a>(keyword_bytes: &[u8], body: Cow<'a, [u8]>) -> Option<RecordView<'a>> {
-    let definition = keywords::lookup(keyword_bytes)?;
+enum TextRecords<'a> {
+    Text(Option<RecordView<'a>>),
+    Xmp(Vec<RecordView<'a>>),
+}
+
+/// テキストチャンクの本文を、XMP パケットなら XMP パーサへ、それ以外は通常の
+/// テキストレコードへ振り分ける（REQ-EXT-06: チャンク種別で挙動を変えない）。
+fn text_records<'a>(keyword_bytes: &[u8], body: Cow<'a, [u8]>) -> TextRecords<'a> {
+    let Some(definition) = keywords::lookup(keyword_bytes) else {
+        return TextRecords::Text(None);
+    };
     if definition.xmp_packet {
-        return None; // delegated to the Phase 3 XMP parser
+        let records = match body {
+            Cow::Borrowed(bytes) => crate::xmp::parse(bytes, Source::PngXmp),
+            Cow::Owned(bytes) => crate::xmp::parse_owned(bytes, Source::PngXmp),
+        };
+        return TextRecords::Xmp(records);
     }
+    TextRecords::Text(text_record(definition, body))
+}
+
+fn text_record<'a>(
+    definition: keywords::PngKeyword,
+    body: Cow<'a, [u8]>,
+) -> Option<RecordView<'a>> {
     let decoded = match body {
         Cow::Borrowed(bytes) => decode_text(bytes)?,
         Cow::Owned(bytes) => decode_text_owned(bytes)?,
@@ -386,88 +410,101 @@ fn text_record<'a>(keyword_bytes: &[u8], body: Cow<'a, [u8]>) -> Option<RecordVi
     })
 }
 
-fn parse_text<'a>(data: &'a [u8]) -> Option<RecordView<'a>> {
-    let split = data.iter().position(|&byte| byte == 0)?;
-    let body_start = split.checked_add(1)?;
-    text_record(&data[..split], Cow::Borrowed(data.get(body_start..)?))
+fn parse_text(data: &[u8]) -> TextRecords<'_> {
+    let Some(split) = data.iter().position(|&byte| byte == 0) else {
+        return TextRecords::Text(None);
+    };
+    let Some(body_start) = split.checked_add(1) else {
+        return TextRecords::Text(None);
+    };
+    let Some(body) = data.get(body_start..) else {
+        return TextRecords::Text(None);
+    };
+    text_records(&data[..split], Cow::Borrowed(body))
 }
 
-fn parse_ztxt(data: &[u8]) -> Option<RecordView<'static>> {
-    let split = data.iter().position(|&byte| byte == 0)?;
-    let method = *data.get(split.checked_add(1)?)?;
+fn parse_ztxt(data: &[u8]) -> TextRecords<'static> {
+    let Some(split) = data.iter().position(|&byte| byte == 0) else {
+        return TextRecords::Text(None);
+    };
+    let Some(&method) = data.get(split.checked_add(1).unwrap_or(usize::MAX)) else {
+        return TextRecords::Text(None);
+    };
     if method != 0 {
-        return None;
+        return TextRecords::Text(None);
     }
-    let body_start = split.checked_add(2)?;
-    let decoded = decompress_text(data.get(body_start..)?)?;
-    text_record(&data[..split], Cow::Owned(decoded))
+    let Some(body_start) = split.checked_add(2) else {
+        return TextRecords::Text(None);
+    };
+    let Some(body) = data.get(body_start..) else {
+        return TextRecords::Text(None);
+    };
+    let Some(decoded) = decompress_text(body) else {
+        return TextRecords::Text(None);
+    };
+    text_records(&data[..split], Cow::Owned(decoded))
 }
 
-enum ItxtRecords<'a> {
-    Text(Option<RecordView<'a>>),
-    Xmp(Vec<RecordView<'a>>),
-}
-
-fn parse_itxt<'a>(data: &'a [u8]) -> ItxtRecords<'a> {
+fn parse_itxt<'a>(data: &'a [u8]) -> TextRecords<'a> {
     let Some(key_end) = data.iter().position(|&byte| byte == 0) else {
-        return ItxtRecords::Text(None);
+        return TextRecords::Text(None);
     };
     let Some(flag) = key_end
         .checked_add(1)
         .and_then(|index| data.get(index))
         .copied()
     else {
-        return ItxtRecords::Text(None);
+        return TextRecords::Text(None);
     };
     let Some(method) = key_end
         .checked_add(2)
         .and_then(|index| data.get(index))
         .copied()
     else {
-        return ItxtRecords::Text(None);
+        return TextRecords::Text(None);
     };
     if method != 0 || flag > 1 {
-        return ItxtRecords::Text(None);
+        return TextRecords::Text(None);
     }
     let Some(after_fields) = key_end.checked_add(3) else {
-        return ItxtRecords::Text(None);
+        return TextRecords::Text(None);
     };
     let Some(lang_end_rel) = data
         .get(after_fields..)
         .and_then(|bytes| bytes.iter().position(|&byte| byte == 0))
     else {
-        return ItxtRecords::Text(None);
+        return TextRecords::Text(None);
     };
     let Some(translated_start) = after_fields
         .checked_add(lang_end_rel)
         .and_then(|offset| offset.checked_add(1))
     else {
-        return ItxtRecords::Text(None);
+        return TextRecords::Text(None);
     };
     let Some(translated_end_rel) = data
         .get(translated_start..)
         .and_then(|bytes| bytes.iter().position(|&byte| byte == 0))
     else {
-        return ItxtRecords::Text(None);
+        return TextRecords::Text(None);
     };
     let Some(text_start) = translated_start
         .checked_add(translated_end_rel)
         .and_then(|offset| offset.checked_add(1))
     else {
-        return ItxtRecords::Text(None);
+        return TextRecords::Text(None);
     };
     let Some(text_bytes) = data.get(text_start..) else {
-        return ItxtRecords::Text(None);
+        return TextRecords::Text(None);
     };
 
     let is_xmp = keywords::lookup(&data[..key_end]).is_some_and(|keyword| keyword.xmp_packet);
     if is_xmp {
         let records = if flag == 1 {
             let Some(decoded) = decompress_text(text_bytes) else {
-                return ItxtRecords::Xmp(Vec::new());
+                return TextRecords::Xmp(Vec::new());
             };
             if std::str::from_utf8(&decoded).is_err() {
-                return ItxtRecords::Xmp(Vec::new());
+                return TextRecords::Xmp(Vec::new());
             }
             crate::xmp::parse_owned(decoded, Source::PngXmp)
         } else if std::str::from_utf8(text_bytes).is_ok() {
@@ -475,12 +512,12 @@ fn parse_itxt<'a>(data: &'a [u8]) -> ItxtRecords<'a> {
         } else {
             Vec::new()
         };
-        return ItxtRecords::Xmp(records);
+        return TextRecords::Xmp(records);
     }
 
     let decoded = if flag == 1 {
         let Some(decoded) = decompress_text(text_bytes) else {
-            return ItxtRecords::Text(None);
+            return TextRecords::Text(None);
         };
         Cow::Owned(decoded)
     } else {
@@ -489,9 +526,9 @@ fn parse_itxt<'a>(data: &'a [u8]) -> ItxtRecords<'a> {
     // iTXt's text is UTF-8 (compressed or not). Decode using the shared UTF-8 /
     // Latin-1 policy only for non-XMP registered text, after field validation.
     if std::str::from_utf8(decoded.as_ref()).is_err() {
-        return ItxtRecords::Text(None);
+        return TextRecords::Text(None);
     }
-    ItxtRecords::Text(text_record(&data[..key_end], decoded))
+    text_records(&data[..key_end], decoded)
 }
 
 fn decode_text<'a>(bytes: &'a [u8]) -> Option<Cow<'a, str>> {
@@ -1382,16 +1419,47 @@ mod tests {
     }
 
     #[test]
-    fn fixture_8_reads_draw_things_xmp_from_itxt_and_suppresses_description() {
+    fn fixture_8_reads_draw_things_xmp_from_itxt_without_synthesizing_bodies() {
         let packet = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description xmlns:d='http://purl.org/dc/elements/1.1/' xmlns:e='http://ns.adobe.com/exif/1.0/'><d:description>duplicate prompt</d:description><e:UserComment>{&quot;c&quot;:&quot;a cat&quot;,&quot;uc&quot;:&quot;bad quality&quot;}</e:UserComment></rdf:Description></rdf:RDF></x:xmpmeta>";
         for compressed in [false, true] {
             let image = png(&[itxt_xmp(packet, compressed)]);
             let result = scan(&image, false);
-            assert_eq!(result.records.len(), 1);
+            // REQ-EXT-07: description を抑制せず、UserComment の本文も合成しない。
+            assert_eq!(result.records.len(), 2);
             assert_eq!(result.records[0].source, Source::PngXmp);
-            assert_eq!(result.records[0].label, "Draw Things (XMP)");
-            assert!(result.records[0].body.contains("\"c\": \"a cat\""));
+            assert_eq!(result.records[0].label, "XMP Description");
+            assert_eq!(result.records[0].body, "duplicate prompt");
+            assert_eq!(result.records[1].label, "XMP UserComment");
+            assert_eq!(result.records[1].body, "{\"c\":\"a cat\",\"uc\":\"bad quality\"}");
         }
+    }
+
+    /// T-16（REQ-EXT-06）: tEXt／zTXt に格納された XMP パケットからもフィールドが読める。
+    #[test]
+    fn t16_reads_xmp_fields_from_text_and_ztxt_chunks() {
+        let packet = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description xmlns:i='http://iptc.org/std/Iptc4xmpExt/2008-02-29/'><i:AIPromptInformation>draw a tree</i:AIPromptInformation></rdf:Description></rdf:RDF></x:xmpmeta>";
+
+        // tEXt
+        let mut text = b"XML:com.adobe.xmp\0".to_vec();
+        text.extend_from_slice(packet);
+        let image = png(&[chunk(b"tEXt", &text, true)]);
+        let result = scan(&image, false);
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].source, Source::PngXmp);
+        assert_eq!(result.records[0].label, "XMP AIPromptInformation");
+        assert_eq!(result.records[0].body, "draw a tree");
+
+        // zTXt
+        let mut data = b"XML:com.adobe.xmp\0".to_vec();
+        data.push(0);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(packet).unwrap();
+        data.extend_from_slice(&encoder.finish().unwrap());
+        let image = png(&[chunk(b"zTXt", &data, true)]);
+        let result = scan(&image, false);
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].source, Source::PngXmp);
+        assert_eq!(result.records[0].body, "draw a tree");
     }
 
     #[test]

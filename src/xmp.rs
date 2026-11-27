@@ -3,7 +3,6 @@
 
 use std::borrow::Cow;
 
-use serde_json::Value;
 
 use crate::record::{RecordView, Source};
 
@@ -255,8 +254,10 @@ pub fn parse_packet<'a>(bytes: &'a [u8], source: Source) -> ParsedPacket<'a> {
         })
         .collect();
 
+    // REQ-EXT-07: 抽出層は本文を合成・置換しない。Draw Things の判定は sorter 側の
+    // 値検証（REQ-CLS-07）へ移し、ここでは生の JSON 本文をそのままレコード化する。
+    // dc:description を抑制する副作用も廃止する。
     let mut has_extended_xmp = None;
-    let mut draw_things_body = None;
     for (field, candidate) in &selected {
         if candidate.value.is_empty() {
             continue;
@@ -264,39 +265,19 @@ pub fn parse_packet<'a>(bytes: &'a [u8], source: Source) -> ParsedPacket<'a> {
         if matches!(field, Field::HasExtendedXmp) {
             has_extended_xmp = Some(candidate.value.to_string());
         }
-        if matches!(field, Field::UserComment) {
-            draw_things_body = draw_things_json(candidate.value.as_ref());
-        }
     }
 
-    let suppress_description = draw_things_body.is_some();
     let mut records_with_position = Vec::new();
     for (field, candidate) in selected {
         if matches!(field, Field::HasExtendedXmp) || candidate.value.is_empty() {
             continue;
         }
-        if matches!(field, Field::Description) && suppress_description {
-            continue;
-        }
-        let label = if matches!(field, Field::UserComment) && suppress_description {
-            "Draw Things (XMP)"
-        } else {
-            field.label()
-        };
-        let body = if matches!(field, Field::UserComment) {
-            draw_things_body
-                .clone()
-                .map(Cow::Owned)
-                .unwrap_or_else(|| candidate.value.clone())
-        } else {
-            candidate.value.clone()
-        };
         records_with_position.push((
             candidate.offset,
             RecordView {
                 source,
-                label: Cow::Borrowed(label),
-                body,
+                label: Cow::Borrowed(field.label()),
+                body: candidate.value.clone(),
                 keyword: Some(Cow::Borrowed(field.local())),
                 detail: None,
             },
@@ -311,50 +292,6 @@ pub fn parse_packet<'a>(bytes: &'a [u8], source: Source) -> ParsedPacket<'a> {
             .collect(),
         has_extended_xmp,
     }
-}
-
-fn draw_things_json(text: &str) -> Option<String> {
-    if !text.trim_start().starts_with('{') {
-        return None;
-    }
-    let value: Value = serde_json::from_str(text).ok()?;
-    if !value.as_object()?.contains_key("c") {
-        return None;
-    }
-    let pretty = serde_json::to_string_pretty(&value).ok()?;
-    let mut output = String::new();
-    for (key, label) in [
-        ("c", "Prompt"),
-        ("uc", "Negative prompt"),
-        ("model", "Model"),
-        ("lora", "LoRA"),
-        ("sampler", "Sampler"),
-        ("scale", "CFG scale"),
-        ("seed", "Seed"),
-        ("seed_mode", "Seed mode"),
-        ("shift", "Shift"),
-        ("steps", "Steps"),
-        ("guidance", "Guidance"),
-    ] {
-        if let Some(item) = value.get(key) {
-            if !output.is_empty() {
-                output.push('\n');
-            }
-            output.push_str(label);
-            output.push_str(": ");
-            output.push_str(&json_value_text(item));
-        }
-    }
-    output.push_str("\nJSON:\n");
-    output.push_str(&pretty);
-    Some(output)
-}
-
-fn json_value_text(value: &Value) -> String {
-    value
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| value.to_string())
 }
 
 fn collect_values<'a>(events: &[Event<'a>]) -> XmpValues<'a> {
@@ -918,43 +855,36 @@ mod tests {
         assert_eq!(parsed.records[0].body, "A&B < A 😀 <raw>&copy;");
     }
 
+    /// T-17（REQ-EXT-07）: Draw Things 風 JSON でも本文を合成せず、dc:description も
+    /// 抑制しない。判定は sorter 側（REQ-CLS-07）に移した。
     #[test]
-    fn xmp_draw_things_json_is_pretty_and_suppresses_description() {
+    fn t17_draw_things_json_is_not_synthesized_nor_suppresses_description() {
         let packet = rdf(
             "<rdf:Description xmlns:d='http://purl.org/dc/elements/1.1/' xmlns:e='http://ns.adobe.com/exif/1.0/'><d:description>duplicate prompt</d:description><e:UserComment>{&quot;c&quot;:&quot;cat&quot;,&quot;uc&quot;:&quot;bad&quot;}</e:UserComment></rdf:Description>",
         );
         let parsed = parse_packet(packet.as_bytes(), Source::PngXmp);
-        assert_eq!(parsed.records.len(), 1);
-        assert_eq!(parsed.records[0].label, "Draw Things (XMP)");
-        assert!(parsed.records[0]
-            .body
-            .starts_with("Prompt: cat\nNegative prompt: bad\nJSON:\n"));
-        assert!(parsed.records[0]
-            .body
-            .ends_with("{\n  \"c\": \"cat\",\n  \"uc\": \"bad\"\n}"));
-    }
-
-    #[test]
-    fn draw_things_json_accepts_leading_whitespace_and_suppresses_description() {
-        let packet = rdf(
-            "<rdf:Description xmlns:d='http://purl.org/dc/elements/1.1/' xmlns:e='http://ns.adobe.com/exif/1.0/'><d:description>duplicate prompt</d:description><e:UserComment> \n\t{&quot;c&quot;:&quot;cat&quot;}</e:UserComment></rdf:Description>",
-        );
-        let parsed = parse_packet(packet.as_bytes(), Source::PngXmp);
-
-        assert_eq!(parsed.records.len(), 1);
-        assert_eq!(parsed.records[0].label, "Draw Things (XMP)");
-        assert!(parsed.records[0].body.starts_with("Prompt: cat\nJSON:\n"));
-    }
-
-    #[test]
-    fn invalid_draw_things_json_keeps_description_and_user_comment() {
-        let packet = rdf(
-            "<rdf:Description xmlns:d='http://purl.org/dc/elements/1.1/' xmlns:e='http://ns.adobe.com/exif/1.0/'><d:description>ordinary description</d:description><e:UserComment>{not json}</e:UserComment></rdf:Description>",
-        );
-        let parsed = parse_packet(packet.as_bytes(), Source::JpegXmp);
         assert_eq!(parsed.records.len(), 2);
         assert_eq!(parsed.records[0].label, "XMP Description");
+        assert_eq!(parsed.records[0].body, "duplicate prompt");
         assert_eq!(parsed.records[1].label, "XMP UserComment");
+        assert_eq!(parsed.records[1].body, "{\"c\":\"cat\",\"uc\":\"bad\"}");
+        assert_eq!(
+            parsed.records[1].keyword.as_deref(),
+            Some("UserComment"),
+            "sorter 側の値検証に生 JSON を渡す"
+        );
+    }
+
+    /// `"c"` 単独（Draw Things の固有キー集合を満たさない）でも本文は素通しする。
+    #[test]
+    fn draw_things_c_only_json_is_passed_through_as_is() {
+        let packet = rdf(
+            "<rdf:Description xmlns:e='http://ns.adobe.com/exif/1.0/'><e:UserComment> \n\t{&quot;c&quot;:&quot;cat&quot;}</e:UserComment></rdf:Description>",
+        );
+        let parsed = parse_packet(packet.as_bytes(), Source::PngXmp);
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.records[0].label, "XMP UserComment");
+        assert_eq!(parsed.records[0].body, " \n\t{\"c\":\"cat\"}");
     }
 
     #[test]

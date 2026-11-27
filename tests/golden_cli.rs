@@ -188,7 +188,7 @@ fn webp_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
     chunk
 }
 
-fn assert_cli_golden(extension: &str, bytes: &[u8], expected: &str) {
+fn run_cli(extension: &str, bytes: &[u8]) -> (String, String) {
     let fixture = TempFixture::new(extension, bytes);
     let output = Command::new(env!("CARGO_BIN_EXE_fast_meta"))
         .arg(&fixture.path)
@@ -200,8 +200,18 @@ fn assert_cli_golden(extension: &str, bytes: &[u8], expected: &str) {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("CLI output is UTF-8");
-    let normalized = stdout.replace(fixture.path.to_str().unwrap(), "<fixture>");
-    assert_eq!(normalized, expected);
+    let stderr = String::from_utf8(output.stderr).expect("CLI stderr is UTF-8");
+    (
+        stdout.replace(fixture.path.to_str().unwrap(), "<fixture>"),
+        stderr,
+    )
+}
+
+fn assert_cli_golden(extension: &str, bytes: &[u8], expected: &str) {
+    let (stdout, stderr) = run_cli(extension, bytes);
+    // G-02: 診断文は stderr へ出るため、stdout のゴールデンには現れない。
+    assert_eq!(stderr, "", "unexpected diagnostics on stderr");
+    assert_eq!(stdout, expected);
 }
 
 #[test]
@@ -230,13 +240,18 @@ fn golden_png_records_keep_file_order_through_buffered_stdout() {
     );
 }
 
+/// G-02（REQ-DSP-02）: 診断文は stderr へ出し、見出し行とレコードは stdout に残す。
 #[test]
-fn golden_comfyui_png_workflow_after_idat() {
+fn golden_comfyui_png_workflow_after_idat_via_stderr_diagnostics() {
     let png = comfy_png_with_tail_workflow();
-    assert_cli_golden(
-        "png",
-        &png,
-        "=== PNG File: <fixture> ===\n(Large file or ComfyUI detected. Scanning tail for metadata...)\n--- workflow ---\n{\"nodes\":[]}\n",
+    let (stdout, stderr) = run_cli("png", &png);
+    assert_eq!(
+        stdout,
+        "=== PNG File: <fixture> ===\n--- workflow ---\n{\"nodes\":[]}\n"
+    );
+    assert_eq!(
+        stderr,
+        "(Large file or ComfyUI detected. Scanning tail for metadata...)\n"
     );
 }
 
@@ -266,7 +281,7 @@ fn golden_webp_xmp_description_element() {
     assert_cli_golden(
         "webp",
         &webp,
-        "=== WebP File: <fixture> ===\n--- Midjourney (XMP) ---\na WebP prompt\n",
+        "=== WebP File: <fixture> ===\n--- XMP Description ---\na WebP prompt\n",
     );
 }
 

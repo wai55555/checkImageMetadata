@@ -96,22 +96,104 @@ fn format_of(bytes: &[u8]) -> Option<Format> {
     }
 }
 
-fn has_normal_metadata(records: &[RecordView<'_>]) -> bool {
-    records.iter().any(|record| {
-        matches!(
-            record.source,
-            record::Source::PngText
-                | record::Source::PngExif
-                | record::Source::PngXmp
-                | record::Source::JpegExif
-                | record::Source::JpegXmp
-                | record::Source::JpegComment
-                | record::Source::JpegIptc
-                | record::Source::WebpExif
-                | record::Source::WebpXmp
-                | record::Source::TiffXmp
-        )
-    })
+/// REQ-EXT-01: Stealth Auto ゲート。「生成内容／生成パラメータを担うレコード」
+/// （実質レコード）が 1 件でもあるときだけ検査を閉じる。汎用レコードだけでは閉じない。
+/// 値ではなくレコード種別で決める（抽出層の検査要否であって生成元の判定ではない）。
+fn is_substantive_record(record: &RecordView<'_>) -> bool {
+    // Trailing は汎用側（ゲートを閉じない）。
+    if matches!(record.source, record::Source::Trailing) {
+        return false;
+    }
+    match record.source {
+        record::Source::PngText => !matches!(
+            record.keyword.as_deref(),
+            Some("Software" | "Title" | "Source")
+        ),
+        record::Source::PngExif
+        | record::Source::JpegExif
+        | record::Source::WebpExif => !matches!(
+            record.keyword.as_deref(),
+            Some("Software" | "Make" | "Model" | "Artist" | "XPComment")
+        ),
+        record::Source::JpegComment => true,
+        record::Source::PngXmp
+        | record::Source::JpegXmp
+        | record::Source::WebpXmp
+        | record::Source::TiffXmp => !matches!(
+            record.keyword.as_deref(),
+            Some("CreatorTool" | "title")
+        ),
+        record::Source::JpegIptc => !matches!(record.keyword.as_deref(), Some("Caption/Abstract")),
+        // 表に無い種別は「内容を担う側」に倒す（仕様書 §5 REQ-EXT-01 の注記）。
+        _ => true,
+    }
+}
+
+fn has_substantive_record(records: &[RecordView<'_>]) -> bool {
+    records.iter().any(is_substantive_record)
+}
+
+#[cfg(test)]
+mod stealth_gate_tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    fn record(
+        source: record::Source,
+        body: &'static str,
+        keyword: Option<&'static str>,
+    ) -> RecordView<'static> {
+        RecordView {
+            source,
+            label: Cow::Borrowed("label"),
+            body: Cow::Borrowed(body),
+            keyword: keyword.map(Cow::Borrowed),
+            detail: None,
+        }
+    }
+
+    /// T-40: 実質レコード（閉じる側）の代表。
+    #[test]
+    fn t40_substantive_records_close_the_stealth_gate() {
+        for record in [
+            record(record::Source::PngText, "Steps: 20", Some("parameters")),
+            record(record::Source::PngText, "a cat", Some("Description")),
+            record(record::Source::JpegExif, "a cat", Some("UserComment")),
+            record(record::Source::PngExif, "a cat", Some("ImageDescription")),
+            record(record::Source::JpegComment, "a cat", None),
+            record(record::Source::PngXmp, "a cat", Some("description")),
+            record(record::Source::PngXmp, "a cat", Some("AIPromptInformation")),
+            record(record::Source::PngXmp, "x", Some("DigitalSourceType")),
+        ] {
+            assert!(
+                has_substantive_record(&[record.clone()]),
+                "{:?}/{:?} must close the gate",
+                record.source,
+                record.keyword
+            );
+        }
+    }
+
+    /// T-40: 汎用レコード（閉じない側）の代表。
+    #[test]
+    fn t40_generic_records_keep_the_stealth_gate_open() {
+        for record in [
+            record(record::Source::PngText, "Celsys Studio Tool", Some("Software")),
+            record(record::Source::PngText, "a title", Some("Title")),
+            record(record::Source::PngExif, "Adobe", Some("Software")),
+            record(record::Source::JpegXmp, "Midjourney", Some("CreatorTool")),
+            record(record::Source::PngXmp, "a title", Some("title")),
+            record(record::Source::JpegIptc, "caption", Some("Caption/Abstract")),
+            record(record::Source::Trailing, "novelai", None),
+        ] {
+            assert!(
+                !has_substantive_record(&[record.clone()]),
+                "{:?}/{:?} must keep the gate open",
+                record.source,
+                record.keyword
+            );
+        }
+    }
 }
 
 fn stealth_record(result: Option<(String, String, String)>) -> Option<RecordView<'static>> {
@@ -154,7 +236,7 @@ pub fn scan_file(
             outcome.comfy_tail_notice = result.stats.comfy_tail_notice;
             let stealth = match options.stealth {
                 StealthPolicy::Never => None,
-                StealthPolicy::Auto if has_normal_metadata(&result.records) => None,
+                StealthPolicy::Auto if has_substantive_record(&result.records) => None,
                 StealthPolicy::Auto | StealthPolicy::Always => check_stealth_png(&mmap),
             };
             for record in &result.records {
@@ -188,12 +270,47 @@ pub fn scan_file(
 }
 
 /// CLI 用：見出し・案内文言・レコード出力を mmap と同じフレーム内で行う。
+/// 診断文（レコードでも見出しでもない案内文言）は従来どおり `out` へ出す。
 pub fn extract_to_writer(
     path: &Path,
     options: &ScanOptions,
     out: &mut dyn Write,
 ) -> Result<ScanOutcome, ScanError> {
-    extract_universal_metadata(path, options, out)
+    // REQ-DSP-02: 呼び出し側が診断文の行き先を分けられるよう、同じ writer を共有する。
+    let shared = std::cell::RefCell::new(out);
+    let mut primary = SharedWriter {
+        inner: &shared,
+    };
+    let mut diagnostics = SharedWriter {
+        inner: &shared,
+    };
+    extract_universal_metadata(path, options, &mut primary, &mut diagnostics)
+}
+
+/// REQ-DSP-02: レコードと見出しは `out`、診断文は `diagnostics` へ出す。
+/// `out` の内容（見出し行とレコード出力）は従来どおりで、診断文だけが分離される。
+pub fn extract_to_writer_with_diagnostics(
+    path: &Path,
+    options: &ScanOptions,
+    out: &mut dyn Write,
+    diagnostics: &mut dyn Write,
+) -> Result<ScanOutcome, ScanError> {
+    extract_universal_metadata(path, options, out, diagnostics)
+}
+
+/// 同じ writer を 2 つの `&mut dyn Write` から使うための小さな共有ラッパー。
+struct SharedWriter<'a, 'b: 'a> {
+    inner: &'a std::cell::RefCell<&'b mut dyn Write>,
+}
+
+impl Write for SharedWriter<'_, '_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.inner.borrow_mut().write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.borrow_mut().flush()
+    }
 }
 
 
@@ -203,20 +320,22 @@ fn extract_png_metadata<W: Write + ?Sized>(
     strict: bool,
     stealth_policy: StealthPolicy,
     writer: &mut W,
+    diagnostics: &mut dyn Write,
 ) -> Result<(usize, bool), ScanError> {
     use crate::output::TextSink;
     let result = png::scan(mmap, strict);
     let comfy_tail_notice = result.stats.comfy_tail_notice;
     writeln!(writer, "=== PNG File: {} ===", path)?;
     if comfy_tail_notice {
+        // REQ-DSP-02: 案内文言はレコードでも見出しでもないため stderr 側へ出す。
         writeln!(
-            writer,
+            diagnostics,
             "(Large file or ComfyUI detected. Scanning tail for metadata...)"
         )?;
     }
     let stealth_result = match stealth_policy {
         StealthPolicy::Never => None,
-        StealthPolicy::Auto if has_normal_metadata(&result.records) => None,
+        StealthPolicy::Auto if has_substantive_record(&result.records) => None,
         StealthPolicy::Auto | StealthPolicy::Always => check_stealth_png(mmap),
     };
     let mut sink = TextSink::default();
@@ -893,6 +1012,7 @@ fn extract_universal_metadata<W: Write + ?Sized>(
     path: &Path,
     options: &ScanOptions,
     writer: &mut W,
+    diagnostics: &mut dyn Write,
 ) -> Result<ScanOutcome, ScanError> {
     let file = File::open(path)?;
     if file.metadata()?.len() == 0 {
@@ -916,6 +1036,7 @@ fn extract_universal_metadata<W: Write + ?Sized>(
                 options.strict,
                 options.stealth,
                 writer,
+                diagnostics,
             )?;
             Ok(ScanOutcome {
                 format: Some(format),

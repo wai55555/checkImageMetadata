@@ -1,4 +1,4 @@
-use fast_meta::{extract_to_writer, ScanOptions, StealthPolicy};
+use fast_meta::{extract_to_writer_with_diagnostics, ScanOptions, StealthPolicy};
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -17,7 +17,7 @@ fn main() {
                     .and_then(|value| StealthPolicy::parse(value))
                 else {
                     eprintln!(
-                        "Usage: {} [--strict] [--stealth <auto|always|never>] <image_file>",
+                        "Usage: {} [--strict] [--stealth <auto|always|never>] <image_file>\n  auto: 生成内容を担うレコードが1件も無いときだけ Stealth PNG Info を調べる",
                         args[0]
                     );
                     std::process::exit(1);
@@ -43,12 +43,22 @@ fn main() {
     };
     let stdout = io::stdout();
     let mut writer = io::BufWriter::new(stdout.lock());
+    // REQ-DSP-02: 診断文（案内文言）は stderr へ出す。見出し行とレコードは stdout のまま。
+    let stderr = io::stderr();
+    let mut diagnostics = io::BufWriter::new(stderr.lock());
     let options = ScanOptions {
         strict,
         stealth: stealth_policy,
     };
-    let result = extract_to_writer(Path::new(image_path), &options, &mut writer);
-    let flush_result = writer.flush();
+    let result = extract_to_writer_with_diagnostics(
+        Path::new(image_path),
+        &options,
+        &mut writer,
+        &mut diagnostics,
+    );
+    let flush_result = writer
+        .flush()
+        .and_then(|()| diagnostics.flush());
     match result {
         Err(e) => {
             eprintln!("Error: {}", e);

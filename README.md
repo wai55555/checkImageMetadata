@@ -8,7 +8,9 @@ PNG、JPEG、WebP から AI 画像生成のプロンプトや生成情報を抽�
 - **JPEG**: EXIF/TIFF、XMP と Extended XMP、COM コメント、APP13/IPTC Caption
 - **WebP**: EXIF/TIFF、XMP
 
-PNG の登録対象キーワードには A1111/Forge (`parameters`)、ComfyUI (`prompt`, `workflow`, `generation_data`)、NovelAI (`Description`, `Comment`)、SwarmUI、InvokeAI が含まれます。XMP から Draw Things、Midjourney、IPTC `AIPromptInformation` などを抽出します。
+PNG の登録対象キーワードには A1111/Forge (`parameters`)、ComfyUI (`prompt`, `workflow`, `generation_data`)、NovelAI (`Description`, `Comment`)、SwarmUI、InvokeAI が含まれます。XMP から dc:description、exif:UserComment、xmp:CreatorTool、IPTC `AIPromptInformation`／`DigitalSourceType` を抽出します。
+
+抽出層は本文を合成・置換しません（Draw Things 形式かどうかの判定は利用側で行います）。JPEG COM には A1111 形式であることを示す構造化された印を `RecordView.detail`（`a1111-both-markers`／`a1111-one-marker`）で付けます。表示層も生成元を推定したラベル付け直しは行いません。
 
 ## 使い方
 
@@ -22,7 +24,7 @@ fast_meta [--strict] [--stealth <auto|always|never>] <image_file>
 .\fast_meta.exe --stealth always image.png
 ```
 
-- `--stealth auto` は既定値です。通常のメタデータがない場合に Stealth PNG Info を調べます。
+- `--stealth auto` は既定値です。生成内容／生成パラメータを担うレコード（`parameters`、`prompt`、`workflow`、`Comment`、`Description`、`UserComment`、`ImageDescription`、COM、XMP の `description`／`AIPromptInformation`／`DigitalSourceType` 等）が1件も無いときだけ Stealth PNG Info を調べます。`Software`／`Title`／`Source`／XMP `CreatorTool`、IPTC Caption のような付随情報だけの画像では検査します。
 - `--stealth always` は通常メタデータと Stealth の両方を調べます。
 - `--stealth never` は Stealth の検査を行いません。
 - `--strict` は PNG の IDAT 列を含む全チャンクを走査します。

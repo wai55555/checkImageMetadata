@@ -281,17 +281,27 @@ fn jpeg_comment_record(payload: &[u8]) -> Option<RecordView<'_>> {
     if body.is_empty() {
         return None;
     }
-    let label = if body.contains("Negative prompt:") || body.contains("Steps:") {
-        "Stable Diffusion (A1111)"
-    } else {
-        "JPEG Comment"
+    // REQ-API-01: A1111 形式かどうかを `detail` の構造化された印で渡す。
+    // 表示用の label は従来どおり付けるが、sorter は label を使わない（REQ-CLS-04）。
+    let has_negative_prompt = body.contains("Negative prompt:");
+    let has_steps = body.contains("Steps:");
+    let (label, detail) = match (has_negative_prompt, has_steps) {
+        (true, true) => (
+            "Stable Diffusion (A1111)",
+            Some(crate::record::JPEG_COM_A1111_BOTH_MARKERS),
+        ),
+        (true, false) | (false, true) => (
+            "Stable Diffusion (A1111)",
+            Some(crate::record::JPEG_COM_A1111_ONE_MARKER),
+        ),
+        (false, false) => ("JPEG Comment", None),
     };
     Some(RecordView {
         source: Source::JpegComment,
         label: Cow::Borrowed(label),
         body,
         keyword: None,
-        detail: None,
+        detail: detail.map(Cow::Borrowed),
     })
 }
 
@@ -615,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn fixture_18_midjourney_description_is_labeled_at_sink_flush() {
+    fn fixture_18_midjourney_description_keeps_the_xmp_description_label() {
         let packet = xmp_packet(
             "<rdf:Description xmlns:dc='http://purl.org/dc/elements/1.1/'><dc:description>a cat --ar 1:1</dc:description></rdf:Description>",
         );
@@ -634,7 +644,7 @@ mod tests {
         sink.flush(&mut output).unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "--- Midjourney (XMP) ---\na cat --ar 1:1\n"
+            "--- XMP Description ---\na cat --ar 1:1\n"
         );
     }
 
@@ -652,8 +662,40 @@ mod tests {
         assert_eq!(parsed.records.len(), 2);
         assert_eq!(parsed.records[0].source, Source::JpegComment);
         assert_eq!(parsed.records[0].label, "Stable Diffusion (A1111)");
+        assert_eq!(
+            parsed.records[0].detail.as_deref(),
+            Some(crate::record::JPEG_COM_A1111_BOTH_MARKERS)
+        );
         assert_eq!(parsed.records[1].label, "JPEG Comment");
+        assert_eq!(parsed.records[1].detail, None);
         assert_eq!(parsed.records[1].body, "plain comment");
+    }
+
+    /// REQ-API-01: 片方のマーカーだけの COM は「片方のみ」の印になる。
+    #[test]
+    fn jpeg_com_with_one_marker_sets_the_partial_mark() {
+        let mut jpeg = b"\xff\xd8".to_vec();
+        jpeg.extend_from_slice(&segment(0xfe, b"Steps: 20 photo comment"));
+        jpeg.extend_from_slice(b"\xff\xda");
+        let parsed = scan(&jpeg);
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(
+            parsed.records[0].detail.as_deref(),
+            Some(crate::record::JPEG_COM_A1111_ONE_MARKER)
+        );
+    }
+
+    /// REQ-API-01: label は表示専用で、印は本文マーカーだけで決まる。
+    #[test]
+    fn jpeg_com_mark_does_not_depend_on_the_label() {
+        let mut jpeg = b"\xff\xd8".to_vec();
+        jpeg.extend_from_slice(&segment(0xfe, b"Negative prompt: blur\nSteps: 20"));
+        jpeg.extend_from_slice(b"\xff\xda");
+        let parsed = scan(&jpeg);
+        assert_eq!(
+            parsed.records[0].detail.as_deref(),
+            Some(crate::record::JPEG_COM_A1111_BOTH_MARKERS)
+        );
     }
 
     #[test]

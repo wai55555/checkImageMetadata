@@ -24,15 +24,8 @@ impl<'a> TextSink<'a> {
     }
 
     pub fn flush<W: Write + ?Sized>(&mut self, writer: &mut W) -> io::Result<()> {
-        let has_sd_metadata = self.records.iter().any(is_sd_metadata_record);
-        if !has_sd_metadata {
-            for record in &mut self.records {
-                if is_xmp_description(record) {
-                    record.label = Cow::Borrowed("Midjourney (XMP)");
-                }
-            }
-        }
-
+        // REQ-DSP-01: 表示層は生成元を推定してラベルを付け直さない。XMP Description は
+        // 常に `XMP Description` と表示する（Midjourney への再ラベルは廃止）。
         if self.records.len() == 1 {
             let record = self.records.pop().expect("one record was checked");
             writer.write_all(b"--- ")?;
@@ -101,35 +94,6 @@ impl<'a> TextSink<'a> {
         }
         Ok(())
     }
-}
-
-fn is_xmp_description(record: &RecordView<'_>) -> bool {
-    matches!(
-        record.source,
-        Source::PngXmp | Source::JpegXmp | Source::WebpXmp | Source::TiffXmp
-    ) && record.label == "XMP Description"
-}
-
-fn is_sd_metadata_record(record: &RecordView<'_>) -> bool {
-    let is_regular_source = matches!(
-        record.source,
-        Source::PngText
-            | Source::PngExif
-            | Source::PngXmp
-            | Source::JpegExif
-            | Source::JpegXmp
-            | Source::JpegComment
-            | Source::JpegIptc
-            | Source::WebpExif
-            | Source::WebpXmp
-            | Source::TiffXmp
-    );
-    is_regular_source
-        && !is_xmp_description(record)
-        && !matches!(
-            record.keyword.as_deref(),
-            Some("CreatorTool" | "DigitalSourceType")
-        )
 }
 
 struct MergedRecord<'a> {
@@ -351,8 +315,10 @@ mod tests {
         );
     }
 
+    /// G-01（REQ-DSP-01）: XMP Description は常に `XMP Description` と表示する。
+    /// 生成元を推定して Midjourney と付け直さない（表示層の再ラベル廃止）。
     #[test]
-    fn xmp_description_is_labeled_midjourney_when_no_other_sd_record_exists() {
+    fn xmp_description_is_never_relabeled_as_midjourney() {
         let mut sink = TextSink::default();
         sink.push_record(record(
             Source::JpegXmp,
@@ -370,9 +336,9 @@ mod tests {
         ));
         let mut output = Vec::new();
         sink.flush(&mut output).unwrap();
-        assert!(String::from_utf8(output)
-            .unwrap()
-            .starts_with("--- Midjourney (XMP) ---\na cat --ar 1:1\n"));
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains("Midjourney (XMP)"), "{output}");
+        assert!(output.starts_with("--- XMP Description ---\na cat --ar 1:1\n"), "{output}");
     }
 
     #[test]
