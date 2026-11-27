@@ -164,6 +164,8 @@ fn source_name(source: Source) -> &'static str {
         Source::WebpExif => "webp_exif",
         Source::WebpXmp => "webp_xmp",
         Source::TiffXmp => "tiff_xmp",
+        // REQ-EXT-03(b): 接続証明の無い Stage C step 4 のレコード（U-4）。
+        Source::PngUnproven => "png_unproven",
         Source::C2pa => "c2pa",
         Source::Trailing => "trailing",
     }

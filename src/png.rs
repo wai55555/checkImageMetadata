@@ -93,30 +93,28 @@ pub fn scan<'a>(bytes: &'a [u8], strict: bool) -> PngScan<'a> {
     let mut stage_a = stage_a(bytes);
     stats.comfy_tail_notice = stage_a.comfy_tail_notice;
 
-    // With no IDAT, Stage A already walked the complete file. Corruption before
-    // the first IDAT is likewise not a reason to guess at later byte patterns.
-    let Some(first_idat) = stage_a.first_idat else {
-        stats.iend_offset = stage_a.iend_end.map(|end| end.saturating_sub(12));
-        let mut located = stage_a.records;
-        append_trailing(bytes, stage_a.iend_end, &mut located);
-        located.sort_by_key(|entry| entry.offset);
-        return PngScan {
-            records: located.into_iter().map(|entry| entry.record).collect(),
-            stats,
-        };
+    // REQ-EXT-03(a): Stage A が壊れたチャンクで止まっても、その時点の部分レコードだけで
+    // 打ち切らず、壊れた位置より後ろから最初の IDAT を再同期探索して Stage B/C の回収を試みる。
+    let first_idat = match stage_a.first_idat {
+        Some(offset) => offset,
+        None => match resync_first_idat(bytes, stage_a.stop) {
+            Some(offset) => offset,
+            None => {
+                // 再同期先も見つからない場合だけ、部分レコードで打ち切る。
+                stats.iend_offset = stage_a.iend_end.map(|end| end.saturating_sub(12));
+                let mut located = stage_a.records;
+                append_trailing(bytes, stage_a.iend_end, &mut located);
+                located.sort_by_key(|entry| entry.offset);
+                return PngScan {
+                    records: located.into_iter().map(|entry| entry.record).collect(),
+                    stats,
+                };
+            }
+        },
     };
-    if stage_a.malformed {
-        return PngScan {
-            records: stage_a
-                .records
-                .into_iter()
-                .map(|entry| entry.record)
-                .collect(),
-            stats,
-        };
-    }
 
-    let (iend, probes, directly_after_idat, last_idat) = find_connected_iend(bytes, stage_a.stop);
+    let (iend, probes, directly_after_idat, last_idat) =
+        find_connected_iend(bytes, first_idat);
     stats.idat_header_probes += probes;
     stats.iend_offset = iend;
 
@@ -190,8 +188,13 @@ pub fn scan<'a>(bytes: &'a [u8], strict: bool) -> PngScan<'a> {
     if !resolved {
         let fallback = full_post_idat_walk(bytes, first_idat);
         stats.stage_c_step = Some(4);
+        // REQ-EXT-03(b) / U-4: IEND 到達も CRC の接続証明も無いまま得たレコードは
+        // 通常レコードとして分類に効かせない。source を分けて隔離する。
         post_idat = retained_chain_records;
         post_idat.extend(fallback.records);
+        for entry in &mut post_idat {
+            entry.record.source = crate::record::Source::PngUnproven;
+        }
         stats.iend_offset = fallback.iend_offset.or(stats.iend_offset);
     }
 
@@ -264,6 +267,48 @@ fn stage_a<'a>(bytes: &'a [u8]) -> StageA<'a> {
             return result;
         }
     }
+}
+
+/// Stage A が壊れた後、最初の IDAT を再同期探索する（REQ-EXT-03(a)）。
+///
+/// `from` は壊れたチャンクの先頭。そこから前方に "IDAT" を探し、直前の長さが
+/// 妥当（0 でなく、ファイル内に収まる）ものを最初の IDAT とみなす。誤検出しても
+/// Stage B/C は IEND への接続証明を要求し、証明できない場合は step 4 の隔離
+/// （`Source::PngUnproven`）に落ちるため、通常レコードとしては効かない。
+fn resync_first_idat(bytes: &[u8], from: usize) -> Option<usize> {
+    let start = from.saturating_add(1).min(bytes.len());
+    let window = bytes.get(start..)?;
+    for relative in memmem::find_iter(window, b"IDAT") {
+        let Some(chunk_type_offset) = start.checked_add(relative) else {
+            continue;
+        };
+        let Some(length_offset) = chunk_type_offset.checked_sub(4) else {
+            continue;
+        };
+        let Some(length_bytes) = bytes.get(length_offset..chunk_type_offset) else {
+            continue;
+        };
+        let Ok(length_bytes) = <[u8; 4]>::try_from(length_bytes) else {
+            continue;
+        };
+        let length = u32::from_be_bytes(length_bytes) as usize;
+        if length == 0 || length > bytes.len() {
+            continue;
+        }
+        let Some(data_end) = chunk_type_offset
+            .checked_add(4)
+            .and_then(|start| start.checked_add(length))
+        else {
+            continue;
+        };
+        let Some(chunk_end) = data_end.checked_add(4) else {
+            continue;
+        };
+        if chunk_end <= bytes.len() {
+            return Some(length_offset);
+        }
+    }
+    None
 }
 
 fn chunk_at(bytes: &[u8], offset: usize) -> Option<Chunk> {
@@ -523,12 +568,15 @@ fn parse_itxt<'a>(data: &'a [u8]) -> TextRecords<'a> {
     } else {
         Cow::Borrowed(text_bytes)
     };
-    // iTXt's text is UTF-8 (compressed or not). Decode using the shared UTF-8 /
-    // Latin-1 policy only for non-XMP registered text, after field validation.
-    if std::str::from_utf8(decoded.as_ref()).is_err() {
-        return TextRecords::Text(None);
-    }
+    // REQ-EXT-13: iTXt の本文デコードを tEXt／zTXt と同じ経路に揃える。
+    // 非 UTF-8 でも Latin-1 フォールバックでレコード化し、キーワードごと
+    // 消失させない（従来はここで None を返してキーワードごと落としていた）。
     text_records(&data[..key_end], decoded)
+}
+
+fn strip_utf8_bom(text: &str) -> &str {
+    // REQ-EXT-14: テキスト先頭の UTF-8 BOM（U+FEFF）は本文の一部ではない。
+    text.strip_prefix('\u{feff}').unwrap_or(text)
 }
 
 fn decode_text<'a>(bytes: &'a [u8]) -> Option<Cow<'a, str>> {
@@ -539,8 +587,8 @@ fn decode_text<'a>(bytes: &'a [u8]) -> Option<Cow<'a, str>> {
         return decode_utf16(rest, false).map(Cow::Owned);
     }
     Some(match std::str::from_utf8(bytes) {
-        Ok(text) => Cow::Borrowed(text),
-        Err(_) => Cow::Owned(decode_latin1(bytes)?),
+        Ok(text) => Cow::Borrowed(strip_utf8_bom(text)),
+        Err(_) => Cow::Owned(strip_utf8_bom(&decode_latin1(bytes)?).to_string()),
     })
 }
 
@@ -552,8 +600,8 @@ fn decode_text_owned(bytes: Vec<u8>) -> Option<Cow<'static, str>> {
         return decode_utf16(rest, false).map(Cow::Owned);
     }
     Some(match String::from_utf8(bytes) {
-        Ok(text) => Cow::Owned(text),
-        Err(error) => Cow::Owned(decode_latin1(&error.into_bytes())?),
+        Ok(text) => Cow::Owned(strip_utf8_bom(&text).to_string()),
+        Err(error) => Cow::Owned(strip_utf8_bom(&decode_latin1(&error.into_bytes())?).to_string()),
     })
 }
 
@@ -1881,6 +1929,78 @@ mod tests {
         image.extend_from_slice(b"tEXt");
         assert_eq!(bodies(&image, false), ["kept"]);
         assert_eq!(bodies(&image, true), ["kept"]);
+    }
+
+    /// T-31（REQ-EXT-13）: iTXt の非 UTF-8 テキストも tEXt と同じく Latin-1 で
+    /// レコード化し、キーワードごと落とさない。
+    #[test]
+    fn t31_itxt_non_utf8_text_is_decoded_like_text_chunks() {
+        let mut data = b"parameters\0".to_vec();
+        data.push(0); // 非圧縮
+        data.push(0);
+        data.extend_from_slice(b"en\0\0"); // language + translated keyword
+        data.extend_from_slice(b"caf\xe9 Steps: 20");
+        let image = png(&[chunk(b"iTXt", &data, true)]);
+        let result = scan(&image, false);
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].keyword.as_deref(), Some("parameters"));
+        assert_eq!(result.records[0].body, "caf\u{e9} Steps: 20");
+    }
+
+    /// T-32（REQ-EXT-14）: 先頭の UTF-8 BOM を取り除いてレコード化する。
+    #[test]
+    fn t32_utf8_bom_is_stripped_from_text_bodies() {
+        let mut body = vec![0xef, 0xbb, 0xbf];
+        body.extend_from_slice(b"a cat\nNegative prompt: blur\nSteps: 20");
+        let image = png(&[text(b"parameters", &body)]);
+        let result = scan(&image, false);
+        assert_eq!(result.records.len(), 1);
+        assert!(result.records[0].body.starts_with("a cat"), "{:?}", result.records[0].body);
+    }
+
+    /// T-11(a)（REQ-EXT-03(a)）: Stage A が壊れたチャンクで止まっても、
+    /// 後方の IDAT 以降のレコードを再同期して回収する。
+    #[test]
+    fn t11a_malformed_stage_a_still_recovers_post_idat_records() {
+        let mut image = SIGNATURE.to_vec();
+        image.extend_from_slice(&chunk(b"IHDR", &[0; 13], true));
+        // 壊れたチャンクヘッダ（長さがファイル長を超える）
+        image.extend_from_slice(&u32::MAX.to_be_bytes());
+        image.extend_from_slice(b"tEXt");
+        image.extend_from_slice(&text(b"parameters", b"after-resync"));
+        image.extend_from_slice(&chunk(b"IDAT", &[1, 2, 3], true));
+        image.extend_from_slice(&text(b"workflow", b"late record"));
+        image.extend_from_slice(&chunk(b"IEND", &[], true));
+
+        let result = scan(&image, false);
+        let bodies: Vec<&str> = result.records.iter().map(|r| r.body.as_ref()).collect();
+        assert!(bodies.contains(&"late record"), "{bodies:?}");
+    }
+
+    /// T-11(b)（REQ-EXT-03(b) / U-4）: 接続証明の無い step 4 のレコードは
+    /// `Source::PngUnproven` となり、通常レコードとして扱われない。
+    #[test]
+    fn t11b_step4_records_are_quarantined_as_unproven() {
+        // IEND を持たない（接続を証明できない）PNG。Stage C step 4 だけが回収できる。
+        let mut image = SIGNATURE.to_vec();
+        image.extend_from_slice(&chunk(b"IHDR", &[0; 13], true));
+        image.extend_from_slice(&chunk(b"IDAT", &[1, 2, 3], true));
+        image.extend_from_slice(&text(b"parameters", b"unproven body"));
+
+        let result = scan(&image, false);
+        assert_eq!(result.stats.stage_c_step, Some(4), "fixture must exercise step 4");
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].source, Source::PngUnproven);
+        assert_eq!(result.records[0].body, "unproven body");
+    }
+
+    /// 接続が証明できた（IEND 到達）レコードは通常の出所のまま残る。
+    #[test]
+    fn connected_records_are_not_quarantined() {
+        let image = png(&[chunk(b"IDAT", &[1, 2, 3], true), text(b"workflow", b"proven")]);
+        let result = scan(&image, false);
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].source, Source::PngText);
     }
 
     #[test]

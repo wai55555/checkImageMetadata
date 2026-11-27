@@ -33,6 +33,18 @@ fast_meta [--strict] [--stealth <auto|always|never>] <image_file>
 
 Stealth PNG は非インターレースのカラータイプ 2 / 4 / 6、8bit / 16bit を対象とします。Adam7 インターレースには対応していません。
 
+## 抽出の堅牢性（2.3.0）
+
+- 壊れた1単位（TIFF のエントリ、PNG のチャンク、XMP の局所破損）が、後ろにある本物の
+  メタデータを落とさない（fail-soft）。
+- PNG の最終手段（Stage C step 4）で、IEND 到達も CRC の接続証明も無いまま得たレコードは
+  `Source::PngUnproven` として隔離する。分類側では「弱い証拠」として扱い、単独では
+  確定に使わないこと（`Source::Trailing` と同じ扱い）。
+- XMP は UTF-16（BOM 付き BE／LE）のパケットも読む（UTF-32 は対象外）。局所破損があっても
+  破損前のフィールドは返し、複数の `rdf:Description` がある場合は主対象
+  （`rdf:about=""`）のフィールドを優先する。
+- WebP は RIFF サイズの範囲内だけを歩き、`Exif\0\0` プレフィクス付きの EXIF も読む。
+
 ## ライブラリとして使う
 
 `fast_meta` は CLI とライブラリの両方を提供します。レコードは mmap の生存期間内に

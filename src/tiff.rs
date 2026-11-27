@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::cmp::Reverse;
 use std::collections::HashSet;
 
 use crate::record::{RecordView, Source};
@@ -144,35 +143,31 @@ impl<'a> TiffReader<'a> {
     }
 }
 
+/// 次IFD を辿る上限（REQ-EXT-05(a)）。循環・巨大な連鎖に対する保険。
+const MAX_IFD_CHAIN: usize = 4;
+
 pub fn parse<'a>(bytes: &'a [u8], source: Source) -> Vec<RecordView<'a>> {
     let Some(reader) = TiffReader::new(bytes) else {
         return Vec::new();
     };
-    let Some(ifd0) = reader.ifd0() else {
+    if reader.ifd0().is_none() {
         return Vec::new();
-    };
+    }
     let mut records = Vec::new();
     let mut visited = HashSet::new();
-    let next_ifd = parse_ifd(
-        &reader,
-        reader.ifd0_offset,
-        source,
-        true,
-        0,
-        &mut visited,
-        &mut records,
-    )
-    .unwrap_or(ifd0.next_ifd);
-    if next_ifd != 0 {
-        let _ = parse_ifd(
-            &reader,
-            next_ifd,
-            source,
-            false,
-            0,
-            &mut visited,
-            &mut records,
-        );
+    let mut offset = reader.ifd0_offset;
+    // REQ-EXT-05(a): IFD1 以降も次IFD を辿る（上限付き）。IFD1 以降の ExifIFD も
+    // IFD0 と同じ条件で辿る（サムネイル側のメタデータを取りこぼさない）。
+    for _ in 0..MAX_IFD_CHAIN {
+        if offset == 0 {
+            break;
+        }
+        let Some(next_ifd) =
+            parse_ifd(&reader, offset, source, true, 0, &mut visited, &mut records)
+        else {
+            break;
+        };
+        offset = next_ifd;
     }
     records
 }
@@ -192,7 +187,11 @@ fn parse_ifd<'a>(
     let ifd = reader.ifd(offset)?;
     let mut exif_offsets = Vec::new();
     for index in 0..ifd.entry_count {
-        let entry = reader.entry(ifd.entries_start, index)?;
+        // REQ-EXT-02: 1 エントリが読めない場合に IFD 全体を放棄せず、
+        // そのエントリだけを飛ばして残りの解析を続ける。
+        let Some(entry) = reader.entry(ifd.entries_start, index) else {
+            continue;
+        };
         if let Some(data) = reader.value(entry) {
             if entry.tag == XML_PACKET {
                 records.extend(xmp::parse(data, Source::TiffXmp));
@@ -255,11 +254,18 @@ fn decode_tag<'a>(tag: u16, data: &'a [u8], source: Source) -> Option<RecordView
 }
 
 fn decode_ascii_field(data: &[u8]) -> Option<Cow<'_, str>> {
-    let text = std::str::from_utf8(data).ok()?.trim_end_matches('\0');
-    if text.is_empty() {
-        None
-    } else {
-        Some(Cow::Borrowed(text))
+    // REQ-EXT-10: UTF-8 でないことを理由にレコードごと落とさない。
+    // ASCII 系タグは Latin-1 として読める（`Steps: ` や `NovelAI` 等の照合対象を残す）。
+    let text = decode_utf8_or_latin1(data)?;
+    let trimmed = text.trim_end_matches('\0');
+    if trimmed.is_empty() {
+        return None;
+    }
+    // 借用のまま返せる場合はコピーしない（既存の高速経路を保つ）。
+    match text {
+        Cow::Borrowed(_) if trimmed.len() == text.len() => Some(text),
+        Cow::Borrowed(borrowed) => Some(Cow::Owned(borrowed.trim_end_matches('\0').to_string())),
+        Cow::Owned(owned) => Some(Cow::Owned(owned.trim_end_matches('\0').to_string())),
     }
 }
 
@@ -335,31 +341,44 @@ fn decode_unicode(bytes: &[u8]) -> String {
     if let Some((order, body)) = utf16_bom(bytes) {
         return decode_utf16_order(body, order);
     }
+    // REQ-EXT-09: EXIF 規格どおり BE を既定とする。LE を採るのは
+    // 「BE で読むと明確に破綻し、LE で読むと明確に成立する」場合に限る
+    // （旧実装は utf16_score の比較だけで LE を選び、健全な BE 本文を壊していた）。
     let big_endian = decode_utf16_order(bytes, Utf16Order::Big);
     let little_endian = decode_utf16_order(bytes, Utf16Order::Little);
-    if utf16_score(&little_endian) < utf16_score(&big_endian) {
+    if utf16_le_is_clearly_better(&big_endian, &little_endian) {
         little_endian
     } else {
         big_endian
     }
 }
 
-fn utf16_score(text: &str) -> (usize, usize, Reverse<usize>) {
-    let mut controls = 0usize;
-    let mut replacements = 0usize;
-    let mut ascii = 0usize;
-    for character in text.chars() {
-        if matches!(character as u32, 0x0000..=0x0008 | 0x000e..=0x001f) {
-            controls += 1;
-        }
-        if character == '\u{fffd}' {
-            replacements += 1;
-        }
-        if character.is_ascii() {
-            ascii += 1;
-        }
+fn utf16_le_is_clearly_better(big_endian: &str, little_endian: &str) -> bool {
+    // LE 側が壊れているなら候補にしない。
+    if utf16_is_clearly_broken(little_endian) {
+        return false;
     }
-    (controls, replacements, Reverse(ascii))
+    // BE 側が制御文字・置換文字を含むなら明確な破綻。LE が健全なら LE を採る。
+    if utf16_is_clearly_broken(big_endian) {
+        return true;
+    }
+    // 明確な破綻ではないが、BE 側に読める ASCII が 1 文字も無く、LE 側にはある
+    // 場合はエンディアン取り違えの典型（LE 格納の ASCII 本文）とみなす。
+    // BE 格納の非 ASCII 本文（日本語のみ等）は LE 側にも ASCII が出ないため
+    // ここでは切り替わらず、BE のまま読まれる。
+    let readable_ascii = |text: &str| {
+        text.chars()
+            .filter(|character| character.is_ascii_graphic() || *character == ' ')
+            .count()
+    };
+    readable_ascii(big_endian) == 0 && readable_ascii(little_endian) > 0
+}
+
+fn utf16_is_clearly_broken(text: &str) -> bool {
+    // NUL 以外の制御文字、または置換文字（デコード失敗）を含むなら明確な破綻。
+    text.chars().any(|character| {
+        matches!(character as u32, 0x0001..=0x0008 | 0x000b..=0x001f) || character == '\u{fffd}'
+    })
 }
 
 fn decode_undefined_code(bytes: &[u8]) -> Option<Cow<'_, str>> {
@@ -436,8 +455,8 @@ fn trim_trailing_nuls(mut text: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse, ByteOrder, TiffReader, Utf16Order, ARTIST, IMAGE_DESCRIPTION, MAKE, MODEL, SOFTWARE,
-        XP_COMMENT,
+        parse, ByteOrder, TiffReader, Utf16Order, ARTIST, IMAGE_DESCRIPTION, MAKE, MAX_IFD_CHAIN,
+        MODEL, SOFTWARE, USER_COMMENT, XP_COMMENT,
     };
     use crate::record::Source;
 
@@ -570,6 +589,168 @@ mod tests {
         assert_eq!(records[0].body, "once");
     }
 
+    /// T-10（REQ-EXT-02）: 壊れたエントリ（値の範囲外）の後ろにある UserComment が読める。
+    #[test]
+    fn t10_broken_entry_does_not_discard_the_rest_of_the_ifd() {
+        let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+        tiff.extend_from_slice(&3u16.to_le_bytes());
+        // 1) ImageDescription の値オフセットをファイル外へ向ける（読めないエントリ）。
+        tiff.extend_from_slice(&entry(IMAGE_DESCRIPTION, 2, 64, 0xFFFF_0000u32.to_le_bytes()));
+        // 2) その後ろの UserComment は読めること。
+        tiff.extend_from_slice(&entry(USER_COMMENT, 7, 4, *b"late"));
+        // 3) さらに後ろの Software も読めること。
+        tiff.extend_from_slice(&entry(SOFTWARE, 2, 4, *b"Soft"));
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+
+        let records = parse(&tiff, Source::JpegExif);
+        let bodies: Vec<&str> = records.iter().map(|record| record.body.as_ref()).collect();
+        assert!(bodies.contains(&"late"), "{bodies:?}");
+        assert!(bodies.contains(&"Soft"), "{bodies:?}");
+    }
+
+    struct IfdPlan {
+        entries: Vec<(u16, u16, Vec<u8>)>,
+        exif_comment: Option<Vec<u8>>,
+    }
+
+    /// 複数 IFD（IFD0 → IFD1 → …）と各 IFD の ExifIFD を持つ最小 TIFF を組み立てる。
+    fn build_multi_ifd(plans: &[IfdPlan]) -> Vec<u8> {
+        let mut ifd_offsets = Vec::with_capacity(plans.len());
+        let mut cursor = 8usize;
+        for plan in plans {
+            ifd_offsets.push(cursor);
+            let count = plan.entries.len() + usize::from(plan.exif_comment.is_some());
+            cursor += 2 + 12 * count + 4;
+        }
+        let mut exif_offsets = Vec::with_capacity(plans.len());
+        for plan in plans {
+            exif_offsets.push(if plan.exif_comment.is_some() {
+                let offset = cursor;
+                cursor += 2 + 12 + 4;
+                Some(offset)
+            } else {
+                None
+            });
+        }
+        let mut value_area = cursor;
+        let mut values: Vec<(usize, Vec<u8>)> = Vec::new();
+
+        let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+        for (index, plan) in plans.iter().enumerate() {
+            let count = plan.entries.len() + usize::from(plan.exif_comment.is_some());
+            tiff.extend_from_slice(&(count as u16).to_le_bytes());
+            for (tag, field_type, value) in &plan.entries {
+                tiff.extend_from_slice(&tag.to_le_bytes());
+                tiff.extend_from_slice(&field_type.to_le_bytes());
+                tiff.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                if value.len() <= 4 {
+                    let mut inline = [0u8; 4];
+                    inline[..value.len()].copy_from_slice(value);
+                    tiff.extend_from_slice(&inline);
+                } else {
+                    tiff.extend_from_slice(&(value_area as u32).to_le_bytes());
+                    values.push((value_area, value.clone()));
+                    value_area += value.len();
+                }
+            }
+            if plan.exif_comment.is_some() {
+                tiff.extend_from_slice(&0x8769u16.to_le_bytes());
+                tiff.extend_from_slice(&4u16.to_le_bytes());
+                tiff.extend_from_slice(&1u32.to_le_bytes());
+                tiff.extend_from_slice(&(exif_offsets[index].unwrap() as u32).to_le_bytes());
+            }
+            let next = ifd_offsets.get(index + 1).copied().unwrap_or(0);
+            tiff.extend_from_slice(&(next as u32).to_le_bytes());
+        }
+        for (index, plan) in plans.iter().enumerate() {
+            if let Some(comment) = &plan.exif_comment {
+                assert_eq!(Some(tiff.len()), exif_offsets[index]);
+                let mut value = b"ASCII\0\0\0".to_vec();
+                value.extend_from_slice(comment);
+                tiff.extend_from_slice(&1u16.to_le_bytes());
+                tiff.extend_from_slice(&USER_COMMENT.to_le_bytes());
+                tiff.extend_from_slice(&7u16.to_le_bytes());
+                tiff.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                tiff.extend_from_slice(&(value_area as u32).to_le_bytes());
+                values.push((value_area, value.clone()));
+                value_area += value.len();
+                tiff.extend_from_slice(&0u32.to_le_bytes());
+            }
+        }
+        for (offset, value) in values {
+            if tiff.len() < offset {
+                tiff.resize(offset, 0);
+            }
+            tiff.extend_from_slice(&value);
+        }
+        tiff
+    }
+
+    /// T-13（REQ-EXT-05(a)）: IFD1 の ExifIFD 内 UserComment が読める。
+    #[test]
+    fn t13_reads_user_comment_from_ifd1_exif_ifd() {
+        let tiff = build_multi_ifd(&[
+            IfdPlan { entries: vec![], exif_comment: Some(b"ifd0".to_vec()) },
+            IfdPlan {
+                entries: vec![(SOFTWARE, 2, b"Thumb".to_vec())],
+                exif_comment: Some(b"ifd1".to_vec()),
+            },
+        ]);
+        let records = parse(&tiff, Source::JpegExif);
+        let bodies: Vec<&str> = records.iter().map(|record| record.body.as_ref()).collect();
+        assert!(bodies.contains(&"ifd0"), "{bodies:?}");
+        assert!(bodies.contains(&"ifd1"), "{bodies:?}");
+        assert!(bodies.contains(&"Thumb"), "{bodies:?}");
+    }
+
+    /// T-42（REQ-EXT-05(a)）: IFD2 以降のタグと IFD2 の ExifIFD 内 UserComment が読める。
+    #[test]
+    fn t42_reads_tags_and_exif_ifd_from_ifd2() {
+        let tiff = build_multi_ifd(&[
+            IfdPlan { entries: vec![], exif_comment: None },
+            IfdPlan { entries: vec![], exif_comment: None },
+            IfdPlan {
+                entries: vec![(IMAGE_DESCRIPTION, 2, b"third".to_vec())],
+                exif_comment: Some(b"ifd2".to_vec()),
+            },
+        ]);
+        let records = parse(&tiff, Source::JpegExif);
+        let bodies: Vec<&str> = records.iter().map(|record| record.body.as_ref()).collect();
+        assert!(bodies.contains(&"third"), "{bodies:?}");
+        assert!(bodies.contains(&"ifd2"), "{bodies:?}");
+    }
+
+    /// REQ-EXT-05(a): 次IFD の追跡は上限（4）で止まる。
+    #[test]
+    fn next_ifd_chain_stops_at_the_depth_cap() {
+        let plans: Vec<IfdPlan> = (0..6)
+            .map(|index| IfdPlan {
+                entries: vec![(IMAGE_DESCRIPTION, 2, format!("ifd{index}").into_bytes())],
+                exif_comment: None,
+            })
+            .collect();
+        let tiff = build_multi_ifd(&plans);
+        let records = parse(&tiff, Source::JpegExif);
+        assert_eq!(records.len(), MAX_IFD_CHAIN);
+        assert_eq!(records[0].body, "ifd0");
+        assert_eq!(records[3].body, "ifd3");
+    }
+
+    /// T-26（REQ-EXT-10）: 非 UTF-8（Latin-1）の ImageDescription でも ASCII 部分が読める。
+    #[test]
+    fn t26_latin1_image_description_is_kept_for_ascii_matching() {
+        let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+        let value = b"caf\xe9 Steps: 20\0";
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&entry(IMAGE_DESCRIPTION, 2, value.len() as u32, 26u32.to_le_bytes()));
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend_from_slice(value);
+        let records = parse(&tiff, Source::JpegExif);
+        assert_eq!(records.len(), 1);
+        assert!(records[0].body.starts_with("caf\u{e9}"), "{:?}", records[0].body);
+        assert!(records[0].body.contains("Steps: 20"));
+    }
+
     #[test]
     fn fixture_17_decodes_undefined_charset_utf16le_without_dropping_prefix() {
         let expected = "parameters=1\nSteps: 4";
@@ -627,16 +808,37 @@ mod tests {
     }
 
     #[test]
-    fn unicode_user_comment_honors_boms_and_scores_bomless_endianness() {
+    fn unicode_user_comment_honors_boms_and_defaults_to_be_without_one() {
+        let expected = "猫parameters=1";
+        // BOM 付きは BOM がエンディアンを決める（両順序）。
         for order in [Utf16Order::Little, Utf16Order::Big] {
-            let expected = "猫parameters=1";
-            for bom in [true, false] {
-                let tiff = tiff_with_comment(&unicode_comment(expected, order, bom));
-                let records = parse(&tiff, Source::JpegExif);
-                assert_eq!(records.len(), 1);
-                assert_eq!(records[0].body, expected);
-            }
+            let tiff = tiff_with_comment(&unicode_comment(expected, order, true));
+            let records = parse(&tiff, Source::JpegExif);
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].body, expected);
         }
+        // REQ-EXT-09: BOM なしは BE が既定。BE 格納の本文はそのまま読める。
+        let tiff = tiff_with_comment(&unicode_comment(expected, Utf16Order::Big, false));
+        let records = parse(&tiff, Source::JpegExif);
+        assert_eq!(records[0].body, expected);
+    }
+
+    /// T-19（REQ-EXT-09）: BOM なし UNICODE の既定は BE。LE は BE が明確に破綻した
+    /// ときだけ採る。ASCII 中心・非ASCII中心のどちらも壊れないことを固定する。
+    #[test]
+    fn t19_bomless_unicode_defaults_to_be_and_accepts_le_only_when_be_is_broken() {
+        for expected in ["parameters=ascii", "猫のパラメータ=1"] {
+            let tiff = tiff_with_comment(&unicode_comment(expected, Utf16Order::Big, false));
+            let records = parse(&tiff, Source::JpegExif);
+            assert_eq!(records[0].body, expected, "BE-stored text must decode as BE");
+        }
+        // LE 格納 [0x00, 0x01] は BE で読むと U+0001（制御文字）になり明確に破綻する。
+        // この場合だけ LE を採用する。
+        let mut comment = b"UNICODE\0".to_vec();
+        comment.extend_from_slice(&[0x00, 0x01]);
+        let tiff = tiff_with_comment(&comment);
+        let records = parse(&tiff, Source::JpegExif);
+        assert_eq!(records[0].body, "Ā");
     }
 
     #[test]
@@ -647,7 +849,7 @@ mod tests {
         assert_eq!(records[0].body, expected);
 
         let long = "x".repeat(10_001);
-        let tiff = tiff_with_comment(&unicode_comment(&long, Utf16Order::Little, false));
+        let tiff = tiff_with_comment(&unicode_comment(&long, Utf16Order::Big, false));
         let records = parse(&tiff, Source::JpegExif);
         assert_eq!(records[0].body, long);
     }

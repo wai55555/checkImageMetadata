@@ -13,6 +13,9 @@ pub enum Source {
     WebpExif,
     WebpXmp,
     TiffXmp,
+    /// Stage C step 4 で、IEND 到達も CRC の接続証明も無しに得た PNG のレコード
+    /// （REQ-EXT-03(b) / U-4）。分類側では Trailing と同様に弱シグナルとして扱う。
+    PngUnproven,
     C2pa,
     Trailing,
 }

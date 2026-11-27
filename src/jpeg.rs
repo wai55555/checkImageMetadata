@@ -229,23 +229,58 @@ fn reassemble_extended_xmp(
     main_has_xmp: bool,
     main_guids: &[String],
 ) -> Option<(Vec<u8>, usize)> {
-    let first = fragments.first()?;
-    if main_has_xmp
-        && !main_guids
-            .iter()
-            .any(|guid| guid.as_bytes().eq_ignore_ascii_case(first.guid))
-    {
-        return None;
-    }
-    if fragments.iter().any(|fragment| {
-        !fragment.guid.eq_ignore_ascii_case(first.guid)
-            || fragment.total_length != first.total_length
-    }) {
-        return None;
+    // REQ-EXT-04(b): GUID と total_length ごとに組を分ける。異なる組の断片が
+    // 混在しているだけで全体を捨てず、完全な組があればそれを採用する。
+    let mut groups: Vec<(&[u8], usize, Vec<&ExtendedFragment<'_>>)> = Vec::new();
+    for fragment in fragments {
+        match groups.iter_mut().find(|(guid, total_length, _)| {
+            guid.eq_ignore_ascii_case(fragment.guid) && *total_length == fragment.total_length
+        }) {
+            Some((_, _, group)) => group.push(fragment),
+            None => groups.push((
+                fragment.guid,
+                fragment.total_length,
+                vec![fragment],
+            )),
+        }
     }
 
-    let total_length = first.total_length;
-    let mut ordered: Vec<_> = fragments.iter().collect();
+    // 主パケットが参照する GUID を最優先し、次に最初に現れた組を優先する。
+    let matches_main = |guid: &[u8]| {
+        main_guids
+            .iter()
+            .any(|candidate| candidate.as_bytes().eq_ignore_ascii_case(guid))
+    };
+    let mut ordered = groups;
+    ordered.sort_by_key(|(guid, _, group)| {
+        let first_seen = group
+            .iter()
+            .map(|fragment| fragment.offset)
+            .min()
+            .unwrap_or(0);
+        (!matches_main(guid), first_seen)
+    });
+
+    for (guid, total_length, group) in ordered {
+        // 主パケットが拡張 GUID を明示している場合、それ以外の組は採用しない
+        // （本体と無関係な断片を混ぜない）。
+        if main_has_xmp && !main_guids.is_empty() && !matches_main(guid) {
+            continue;
+        }
+        if let Some(packet) = assemble_extended_group(&group, total_length) {
+            return Some(packet);
+        }
+    }
+    None
+}
+
+/// 1 つの GUID 組が連続・完全に揃っているかを検証して連結する。
+fn assemble_extended_group(
+    group: &[&ExtendedFragment<'_>],
+    total_length: usize,
+) -> Option<(Vec<u8>, usize)> {
+    let first_offset = group.iter().map(|fragment| fragment.offset).min()?;
+    let mut ordered: Vec<_> = group.to_vec();
     ordered.sort_by_key(|fragment| fragment.fragment_offset);
     let mut expected_offset = 0usize;
     let mut previous_offset = None;
@@ -270,7 +305,7 @@ fn reassemble_extended_xmp(
     for fragment in ordered {
         packet.extend_from_slice(fragment.body);
     }
-    Some((packet, first.offset))
+    Some((packet, first_offset))
 }
 
 fn jpeg_comment_record(payload: &[u8]) -> Option<RecordView<'_>> {
@@ -769,6 +804,56 @@ mod tests {
         let parsed = scan(&jpeg);
         assert_eq!(parsed.records.len(), 1);
         assert_eq!(parsed.records[0].body, "main packet");
+    }
+
+    /// T-12（REQ-EXT-04(b)）: GUID／total_length の異なる断片が混在しても、
+    /// 完全な組があればそれを採用する。
+    #[test]
+    fn t12_mixed_extended_xmp_fragments_still_use_the_complete_group() {
+        let guid = b"0123456789abcdef0123456789abcdef";
+        let main = xmp_packet(&format!(
+            "<rdf:Description xmlns:n='http://ns.adobe.com/xap/1.0/note/' n:HasExtendedXMP='{}'/>",
+            String::from_utf8_lossy(guid)
+        ));
+        let complete = xmp_packet(
+            "<rdf:Description xmlns:dc='http://purl.org/dc/elements/1.1/'><dc:description>complete group</dc:description></rdf:Description>",
+        );
+        let mut jpeg = b"\xff\xd8".to_vec();
+        jpeg.extend_from_slice(&main_xmp_segment(&main));
+        // 別 GUID・別 total_length の断片を先に置く（混在）。
+        jpeg.extend_from_slice(&extended_xmp_segment(
+            b"fedcba9876543210fedcba9876543210",
+            999,
+            0,
+            b"unrelated fragment",
+        ));
+        // 同じ GUID でも total_length の違う断片（不完全な組）。
+        jpeg.extend_from_slice(&extended_xmp_segment(guid, complete.len() + 10, 0, b"broken"));
+        // 完全な組。
+        jpeg.extend_from_slice(&extended_xmp_segment(guid, complete.len(), 0, &complete));
+        jpeg.extend_from_slice(b"\xff\xda");
+
+        let parsed = scan(&jpeg);
+        let bodies: Vec<&str> = parsed.records.iter().map(|record| record.body.as_ref()).collect();
+        assert!(bodies.contains(&"complete group"), "{bodies:?}");
+    }
+
+    /// T-39（REQ-EXT-05(b)）: セグメント長不正で歩行を止めても、
+    /// それまでに得たレコードは捨てずに返す。
+    #[test]
+    fn t39_jpeg_returns_records_before_an_invalid_segment_length() {
+        let xmp = xmp_packet(
+            "<rdf:Description xmlns:dc='http://purl.org/dc/elements/1.1/'><dc:description>before damage</dc:description></rdf:Description>",
+        );
+        let mut jpeg = b"\xff\xd8".to_vec();
+        jpeg.extend_from_slice(&main_xmp_segment(&xmp));
+        // 長さ 0 の不正セグメント。
+        jpeg.extend_from_slice(&[0xff, 0xfe, 0x00, 0x00]);
+        jpeg.extend_from_slice(b"\xff\xda");
+
+        let parsed = scan(&jpeg);
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.records[0].body, "before damage");
     }
 
     #[test]
