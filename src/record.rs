@@ -13,6 +13,9 @@ pub enum Source {
     WebpExif,
     WebpXmp,
     TiffXmp,
+    /// Stage C step 4 で、IEND 到達も CRC の接続証明も無しに得た PNG のレコード
+    /// （REQ-EXT-03(b) / U-4）。分類側では Trailing と同様に弱シグナルとして扱う。
+    PngUnproven,
     C2pa,
     Trailing,
 }
@@ -29,3 +32,9 @@ pub struct RecordView<'a> {
 pub trait MetadataSink<'a> {
     fn on_record(&mut self, record: &RecordView<'a>);
 }
+
+/// REQ-API-01: JPEG COM が A1111 形式であることを示す構造化された印。
+/// `RecordView.detail` に設定し、sorter は表示ラベルではなくこの値で判定する。
+/// 「両マーカーあり」は中シグナル、「片方のみ」は弱シグナルとして扱う。
+pub const JPEG_COM_A1111_BOTH_MARKERS: &str = "a1111-both-markers";
+pub const JPEG_COM_A1111_ONE_MARKER: &str = "a1111-one-marker";

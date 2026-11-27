@@ -13,7 +13,10 @@ pub mod tiff;
 pub mod xmp;
 
 pub use extract::{
-    extract_to_writer, scan_file, Format, RecordSink, ScanError, ScanOptions, ScanOutcome,
+    extract_to_writer, extract_to_writer_with_diagnostics, scan_file, Format, RecordSink, ScanError,
+    ScanOptions, ScanOutcome,
     StealthPolicy,
 };
-pub use record::{RecordView, Source};
+pub use record::{
+    RecordView, Source, JPEG_COM_A1111_BOTH_MARKERS, JPEG_COM_A1111_ONE_MARKER,
+};

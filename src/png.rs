@@ -93,30 +93,28 @@ pub fn scan<'a>(bytes: &'a [u8], strict: bool) -> PngScan<'a> {
     let mut stage_a = stage_a(bytes);
     stats.comfy_tail_notice = stage_a.comfy_tail_notice;
 
-    // With no IDAT, Stage A already walked the complete file. Corruption before
-    // the first IDAT is likewise not a reason to guess at later byte patterns.
-    let Some(first_idat) = stage_a.first_idat else {
-        stats.iend_offset = stage_a.iend_end.map(|end| end.saturating_sub(12));
-        let mut located = stage_a.records;
-        append_trailing(bytes, stage_a.iend_end, &mut located);
-        located.sort_by_key(|entry| entry.offset);
-        return PngScan {
-            records: located.into_iter().map(|entry| entry.record).collect(),
-            stats,
-        };
+    // REQ-EXT-03(a): Stage A が壊れたチャンクで止まっても、その時点の部分レコードだけで
+    // 打ち切らず、壊れた位置より後ろから最初の IDAT を再同期探索して Stage B/C の回収を試みる。
+    let first_idat = match stage_a.first_idat {
+        Some(offset) => offset,
+        None => match resync_first_idat(bytes, stage_a.stop) {
+            Some(offset) => offset,
+            None => {
+                // 再同期先も見つからない場合だけ、部分レコードで打ち切る。
+                stats.iend_offset = stage_a.iend_end.map(|end| end.saturating_sub(12));
+                let mut located = stage_a.records;
+                append_trailing(bytes, stage_a.iend_end, &mut located);
+                located.sort_by_key(|entry| entry.offset);
+                return PngScan {
+                    records: located.into_iter().map(|entry| entry.record).collect(),
+                    stats,
+                };
+            }
+        },
     };
-    if stage_a.malformed {
-        return PngScan {
-            records: stage_a
-                .records
-                .into_iter()
-                .map(|entry| entry.record)
-                .collect(),
-            stats,
-        };
-    }
 
-    let (iend, probes, directly_after_idat, last_idat) = find_connected_iend(bytes, stage_a.stop);
+    let (iend, probes, directly_after_idat, last_idat) =
+        find_connected_iend(bytes, first_idat);
     stats.idat_header_probes += probes;
     stats.iend_offset = iend;
 
@@ -190,8 +188,13 @@ pub fn scan<'a>(bytes: &'a [u8], strict: bool) -> PngScan<'a> {
     if !resolved {
         let fallback = full_post_idat_walk(bytes, first_idat);
         stats.stage_c_step = Some(4);
+        // REQ-EXT-03(b) / U-4: IEND 到達も CRC の接続証明も無いまま得たレコードは
+        // 通常レコードとして分類に効かせない。source を分けて隔離する。
         post_idat = retained_chain_records;
         post_idat.extend(fallback.records);
+        for entry in &mut post_idat {
+            entry.record.source = crate::record::Source::PngUnproven;
+        }
         stats.iend_offset = fallback.iend_offset.or(stats.iend_offset);
     }
 
@@ -266,6 +269,48 @@ fn stage_a<'a>(bytes: &'a [u8]) -> StageA<'a> {
     }
 }
 
+/// Stage A が壊れた後、最初の IDAT を再同期探索する（REQ-EXT-03(a)）。
+///
+/// `from` は壊れたチャンクの先頭。そこから前方に "IDAT" を探し、直前の長さが
+/// 妥当（0 でなく、ファイル内に収まる）ものを最初の IDAT とみなす。誤検出しても
+/// Stage B/C は IEND への接続証明を要求し、証明できない場合は step 4 の隔離
+/// （`Source::PngUnproven`）に落ちるため、通常レコードとしては効かない。
+fn resync_first_idat(bytes: &[u8], from: usize) -> Option<usize> {
+    let start = from.saturating_add(1).min(bytes.len());
+    let window = bytes.get(start..)?;
+    for relative in memmem::find_iter(window, b"IDAT") {
+        let Some(chunk_type_offset) = start.checked_add(relative) else {
+            continue;
+        };
+        let Some(length_offset) = chunk_type_offset.checked_sub(4) else {
+            continue;
+        };
+        let Some(length_bytes) = bytes.get(length_offset..chunk_type_offset) else {
+            continue;
+        };
+        let Ok(length_bytes) = <[u8; 4]>::try_from(length_bytes) else {
+            continue;
+        };
+        let length = u32::from_be_bytes(length_bytes) as usize;
+        if length == 0 || length > bytes.len() {
+            continue;
+        }
+        let Some(data_end) = chunk_type_offset
+            .checked_add(4)
+            .and_then(|start| start.checked_add(length))
+        else {
+            continue;
+        };
+        let Some(chunk_end) = data_end.checked_add(4) else {
+            continue;
+        };
+        if chunk_end <= bytes.len() {
+            return Some(length_offset);
+        }
+    }
+    None
+}
+
 fn chunk_at(bytes: &[u8], offset: usize) -> Option<Chunk> {
     let header_end = offset.checked_add(8)?;
     let header = bytes.get(offset..header_end)?;
@@ -290,33 +335,15 @@ fn kind(bytes: &[u8; 4]) -> u32 {
 fn collect_chunk_records<'a>(bytes: &'a [u8], chunk: Chunk, output: &mut Vec<LocatedRecord<'a>>) {
     let data = chunk.data(bytes);
     match chunk.kind {
-        k if k == kind(b"tEXt") => append_record(
-            output,
-            chunk.offset,
-            set_text_detail(parse_text(data), "tEXt"),
-        ),
-        k if k == kind(b"zTXt") => append_record(
-            output,
-            chunk.offset,
-            set_text_detail(parse_ztxt(data), "zTXt"),
-        ),
-        k if k == kind(b"iTXt") => match parse_itxt(data) {
-            ItxtRecords::Text(record) => {
-                append_record(output, chunk.offset, set_text_detail(record, "iTXt"))
-            }
-            ItxtRecords::Xmp(records) => {
-                output.extend(
-                    records
-                        .into_iter()
-                        .enumerate()
-                        .map(|(record_index, record)| LocatedRecord {
-                            offset: chunk.offset,
-                            record_index,
-                            record,
-                        }),
-                );
-            }
-        },
+        k if k == kind(b"tEXt") => {
+            append_text_records(output, chunk.offset, parse_text(data), "tEXt")
+        }
+        k if k == kind(b"zTXt") => {
+            append_text_records(output, chunk.offset, parse_ztxt(data), "zTXt")
+        }
+        k if k == kind(b"iTXt") => {
+            append_text_records(output, chunk.offset, parse_itxt(data), "iTXt")
+        }
         k if k == kind(b"eXIf") => {
             output.extend(
                 tiff::parse(data, Source::PngExif)
@@ -330,6 +357,28 @@ fn collect_chunk_records<'a>(bytes: &'a [u8], chunk: Chunk, output: &mut Vec<Loc
             );
         }
         _ => {}
+    }
+}
+
+/// REQ-EXT-06: テキストチャンクの種別（tEXt／zTXt／iTXt）で委譲先を変えない。
+fn append_text_records<'a>(
+    output: &mut Vec<LocatedRecord<'a>>,
+    offset: usize,
+    records: TextRecords<'a>,
+    detail: &'static str,
+) {
+    match records {
+        TextRecords::Text(record) => append_record(output, offset, set_text_detail(record, detail)),
+        TextRecords::Xmp(records) => output.extend(
+            records
+                .into_iter()
+                .enumerate()
+                .map(|(record_index, record)| LocatedRecord {
+                    offset,
+                    record_index,
+                    record,
+                }),
+        ),
     }
 }
 
@@ -357,11 +406,31 @@ fn append_record<'a>(
     }
 }
 
-fn text_record<'a>(keyword_bytes: &[u8], body: Cow<'a, [u8]>) -> Option<RecordView<'a>> {
-    let definition = keywords::lookup(keyword_bytes)?;
+enum TextRecords<'a> {
+    Text(Option<RecordView<'a>>),
+    Xmp(Vec<RecordView<'a>>),
+}
+
+/// テキストチャンクの本文を、XMP パケットなら XMP パーサへ、それ以外は通常の
+/// テキストレコードへ振り分ける（REQ-EXT-06: チャンク種別で挙動を変えない）。
+fn text_records<'a>(keyword_bytes: &[u8], body: Cow<'a, [u8]>) -> TextRecords<'a> {
+    let Some(definition) = keywords::lookup(keyword_bytes) else {
+        return TextRecords::Text(None);
+    };
     if definition.xmp_packet {
-        return None; // delegated to the Phase 3 XMP parser
+        let records = match body {
+            Cow::Borrowed(bytes) => crate::xmp::parse(bytes, Source::PngXmp),
+            Cow::Owned(bytes) => crate::xmp::parse_owned(bytes, Source::PngXmp),
+        };
+        return TextRecords::Xmp(records);
     }
+    TextRecords::Text(text_record(definition, body))
+}
+
+fn text_record<'a>(
+    definition: keywords::PngKeyword,
+    body: Cow<'a, [u8]>,
+) -> Option<RecordView<'a>> {
     let decoded = match body {
         Cow::Borrowed(bytes) => decode_text(bytes)?,
         Cow::Owned(bytes) => decode_text_owned(bytes)?,
@@ -386,88 +455,101 @@ fn text_record<'a>(keyword_bytes: &[u8], body: Cow<'a, [u8]>) -> Option<RecordVi
     })
 }
 
-fn parse_text<'a>(data: &'a [u8]) -> Option<RecordView<'a>> {
-    let split = data.iter().position(|&byte| byte == 0)?;
-    let body_start = split.checked_add(1)?;
-    text_record(&data[..split], Cow::Borrowed(data.get(body_start..)?))
+fn parse_text(data: &[u8]) -> TextRecords<'_> {
+    let Some(split) = data.iter().position(|&byte| byte == 0) else {
+        return TextRecords::Text(None);
+    };
+    let Some(body_start) = split.checked_add(1) else {
+        return TextRecords::Text(None);
+    };
+    let Some(body) = data.get(body_start..) else {
+        return TextRecords::Text(None);
+    };
+    text_records(&data[..split], Cow::Borrowed(body))
 }
 
-fn parse_ztxt(data: &[u8]) -> Option<RecordView<'static>> {
-    let split = data.iter().position(|&byte| byte == 0)?;
-    let method = *data.get(split.checked_add(1)?)?;
+fn parse_ztxt(data: &[u8]) -> TextRecords<'static> {
+    let Some(split) = data.iter().position(|&byte| byte == 0) else {
+        return TextRecords::Text(None);
+    };
+    let Some(&method) = data.get(split.checked_add(1).unwrap_or(usize::MAX)) else {
+        return TextRecords::Text(None);
+    };
     if method != 0 {
-        return None;
+        return TextRecords::Text(None);
     }
-    let body_start = split.checked_add(2)?;
-    let decoded = decompress_text(data.get(body_start..)?)?;
-    text_record(&data[..split], Cow::Owned(decoded))
+    let Some(body_start) = split.checked_add(2) else {
+        return TextRecords::Text(None);
+    };
+    let Some(body) = data.get(body_start..) else {
+        return TextRecords::Text(None);
+    };
+    let Some(decoded) = decompress_text(body) else {
+        return TextRecords::Text(None);
+    };
+    text_records(&data[..split], Cow::Owned(decoded))
 }
 
-enum ItxtRecords<'a> {
-    Text(Option<RecordView<'a>>),
-    Xmp(Vec<RecordView<'a>>),
-}
-
-fn parse_itxt<'a>(data: &'a [u8]) -> ItxtRecords<'a> {
+fn parse_itxt<'a>(data: &'a [u8]) -> TextRecords<'a> {
     let Some(key_end) = data.iter().position(|&byte| byte == 0) else {
-        return ItxtRecords::Text(None);
+        return TextRecords::Text(None);
     };
     let Some(flag) = key_end
         .checked_add(1)
         .and_then(|index| data.get(index))
         .copied()
     else {
-        return ItxtRecords::Text(None);
+        return TextRecords::Text(None);
     };
     let Some(method) = key_end
         .checked_add(2)
         .and_then(|index| data.get(index))
         .copied()
     else {
-        return ItxtRecords::Text(None);
+        return TextRecords::Text(None);
     };
     if method != 0 || flag > 1 {
-        return ItxtRecords::Text(None);
+        return TextRecords::Text(None);
     }
     let Some(after_fields) = key_end.checked_add(3) else {
-        return ItxtRecords::Text(None);
+        return TextRecords::Text(None);
     };
     let Some(lang_end_rel) = data
         .get(after_fields..)
         .and_then(|bytes| bytes.iter().position(|&byte| byte == 0))
     else {
-        return ItxtRecords::Text(None);
+        return TextRecords::Text(None);
     };
     let Some(translated_start) = after_fields
         .checked_add(lang_end_rel)
         .and_then(|offset| offset.checked_add(1))
     else {
-        return ItxtRecords::Text(None);
+        return TextRecords::Text(None);
     };
     let Some(translated_end_rel) = data
         .get(translated_start..)
         .and_then(|bytes| bytes.iter().position(|&byte| byte == 0))
     else {
-        return ItxtRecords::Text(None);
+        return TextRecords::Text(None);
     };
     let Some(text_start) = translated_start
         .checked_add(translated_end_rel)
         .and_then(|offset| offset.checked_add(1))
     else {
-        return ItxtRecords::Text(None);
+        return TextRecords::Text(None);
     };
     let Some(text_bytes) = data.get(text_start..) else {
-        return ItxtRecords::Text(None);
+        return TextRecords::Text(None);
     };
 
     let is_xmp = keywords::lookup(&data[..key_end]).is_some_and(|keyword| keyword.xmp_packet);
     if is_xmp {
         let records = if flag == 1 {
             let Some(decoded) = decompress_text(text_bytes) else {
-                return ItxtRecords::Xmp(Vec::new());
+                return TextRecords::Xmp(Vec::new());
             };
             if std::str::from_utf8(&decoded).is_err() {
-                return ItxtRecords::Xmp(Vec::new());
+                return TextRecords::Xmp(Vec::new());
             }
             crate::xmp::parse_owned(decoded, Source::PngXmp)
         } else if std::str::from_utf8(text_bytes).is_ok() {
@@ -475,23 +557,26 @@ fn parse_itxt<'a>(data: &'a [u8]) -> ItxtRecords<'a> {
         } else {
             Vec::new()
         };
-        return ItxtRecords::Xmp(records);
+        return TextRecords::Xmp(records);
     }
 
     let decoded = if flag == 1 {
         let Some(decoded) = decompress_text(text_bytes) else {
-            return ItxtRecords::Text(None);
+            return TextRecords::Text(None);
         };
         Cow::Owned(decoded)
     } else {
         Cow::Borrowed(text_bytes)
     };
-    // iTXt's text is UTF-8 (compressed or not). Decode using the shared UTF-8 /
-    // Latin-1 policy only for non-XMP registered text, after field validation.
-    if std::str::from_utf8(decoded.as_ref()).is_err() {
-        return ItxtRecords::Text(None);
-    }
-    ItxtRecords::Text(text_record(&data[..key_end], decoded))
+    // REQ-EXT-13: iTXt の本文デコードを tEXt／zTXt と同じ経路に揃える。
+    // 非 UTF-8 でも Latin-1 フォールバックでレコード化し、キーワードごと
+    // 消失させない（従来はここで None を返してキーワードごと落としていた）。
+    text_records(&data[..key_end], decoded)
+}
+
+fn strip_utf8_bom(text: &str) -> &str {
+    // REQ-EXT-14: テキスト先頭の UTF-8 BOM（U+FEFF）は本文の一部ではない。
+    text.strip_prefix('\u{feff}').unwrap_or(text)
 }
 
 fn decode_text<'a>(bytes: &'a [u8]) -> Option<Cow<'a, str>> {
@@ -502,8 +587,8 @@ fn decode_text<'a>(bytes: &'a [u8]) -> Option<Cow<'a, str>> {
         return decode_utf16(rest, false).map(Cow::Owned);
     }
     Some(match std::str::from_utf8(bytes) {
-        Ok(text) => Cow::Borrowed(text),
-        Err(_) => Cow::Owned(decode_latin1(bytes)?),
+        Ok(text) => Cow::Borrowed(strip_utf8_bom(text)),
+        Err(_) => Cow::Owned(strip_utf8_bom(&decode_latin1(bytes)?).to_string()),
     })
 }
 
@@ -515,8 +600,8 @@ fn decode_text_owned(bytes: Vec<u8>) -> Option<Cow<'static, str>> {
         return decode_utf16(rest, false).map(Cow::Owned);
     }
     Some(match String::from_utf8(bytes) {
-        Ok(text) => Cow::Owned(text),
-        Err(error) => Cow::Owned(decode_latin1(&error.into_bytes())?),
+        Ok(text) => Cow::Owned(strip_utf8_bom(&text).to_string()),
+        Err(error) => Cow::Owned(strip_utf8_bom(&decode_latin1(&error.into_bytes())?).to_string()),
     })
 }
 
@@ -1382,16 +1467,47 @@ mod tests {
     }
 
     #[test]
-    fn fixture_8_reads_draw_things_xmp_from_itxt_and_suppresses_description() {
+    fn fixture_8_reads_draw_things_xmp_from_itxt_without_synthesizing_bodies() {
         let packet = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description xmlns:d='http://purl.org/dc/elements/1.1/' xmlns:e='http://ns.adobe.com/exif/1.0/'><d:description>duplicate prompt</d:description><e:UserComment>{&quot;c&quot;:&quot;a cat&quot;,&quot;uc&quot;:&quot;bad quality&quot;}</e:UserComment></rdf:Description></rdf:RDF></x:xmpmeta>";
         for compressed in [false, true] {
             let image = png(&[itxt_xmp(packet, compressed)]);
             let result = scan(&image, false);
-            assert_eq!(result.records.len(), 1);
+            // REQ-EXT-07: description を抑制せず、UserComment の本文も合成しない。
+            assert_eq!(result.records.len(), 2);
             assert_eq!(result.records[0].source, Source::PngXmp);
-            assert_eq!(result.records[0].label, "Draw Things (XMP)");
-            assert!(result.records[0].body.contains("\"c\": \"a cat\""));
+            assert_eq!(result.records[0].label, "XMP Description");
+            assert_eq!(result.records[0].body, "duplicate prompt");
+            assert_eq!(result.records[1].label, "XMP UserComment");
+            assert_eq!(result.records[1].body, "{\"c\":\"a cat\",\"uc\":\"bad quality\"}");
         }
+    }
+
+    /// T-16（REQ-EXT-06）: tEXt／zTXt に格納された XMP パケットからもフィールドが読める。
+    #[test]
+    fn t16_reads_xmp_fields_from_text_and_ztxt_chunks() {
+        let packet = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description xmlns:i='http://iptc.org/std/Iptc4xmpExt/2008-02-29/'><i:AIPromptInformation>draw a tree</i:AIPromptInformation></rdf:Description></rdf:RDF></x:xmpmeta>";
+
+        // tEXt
+        let mut text = b"XML:com.adobe.xmp\0".to_vec();
+        text.extend_from_slice(packet);
+        let image = png(&[chunk(b"tEXt", &text, true)]);
+        let result = scan(&image, false);
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].source, Source::PngXmp);
+        assert_eq!(result.records[0].label, "XMP AIPromptInformation");
+        assert_eq!(result.records[0].body, "draw a tree");
+
+        // zTXt
+        let mut data = b"XML:com.adobe.xmp\0".to_vec();
+        data.push(0);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(packet).unwrap();
+        data.extend_from_slice(&encoder.finish().unwrap());
+        let image = png(&[chunk(b"zTXt", &data, true)]);
+        let result = scan(&image, false);
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].source, Source::PngXmp);
+        assert_eq!(result.records[0].body, "draw a tree");
     }
 
     #[test]
@@ -1813,6 +1929,78 @@ mod tests {
         image.extend_from_slice(b"tEXt");
         assert_eq!(bodies(&image, false), ["kept"]);
         assert_eq!(bodies(&image, true), ["kept"]);
+    }
+
+    /// T-31（REQ-EXT-13）: iTXt の非 UTF-8 テキストも tEXt と同じく Latin-1 で
+    /// レコード化し、キーワードごと落とさない。
+    #[test]
+    fn t31_itxt_non_utf8_text_is_decoded_like_text_chunks() {
+        let mut data = b"parameters\0".to_vec();
+        data.push(0); // 非圧縮
+        data.push(0);
+        data.extend_from_slice(b"en\0\0"); // language + translated keyword
+        data.extend_from_slice(b"caf\xe9 Steps: 20");
+        let image = png(&[chunk(b"iTXt", &data, true)]);
+        let result = scan(&image, false);
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].keyword.as_deref(), Some("parameters"));
+        assert_eq!(result.records[0].body, "caf\u{e9} Steps: 20");
+    }
+
+    /// T-32（REQ-EXT-14）: 先頭の UTF-8 BOM を取り除いてレコード化する。
+    #[test]
+    fn t32_utf8_bom_is_stripped_from_text_bodies() {
+        let mut body = vec![0xef, 0xbb, 0xbf];
+        body.extend_from_slice(b"a cat\nNegative prompt: blur\nSteps: 20");
+        let image = png(&[text(b"parameters", &body)]);
+        let result = scan(&image, false);
+        assert_eq!(result.records.len(), 1);
+        assert!(result.records[0].body.starts_with("a cat"), "{:?}", result.records[0].body);
+    }
+
+    /// T-11(a)（REQ-EXT-03(a)）: Stage A が壊れたチャンクで止まっても、
+    /// 後方の IDAT 以降のレコードを再同期して回収する。
+    #[test]
+    fn t11a_malformed_stage_a_still_recovers_post_idat_records() {
+        let mut image = SIGNATURE.to_vec();
+        image.extend_from_slice(&chunk(b"IHDR", &[0; 13], true));
+        // 壊れたチャンクヘッダ（長さがファイル長を超える）
+        image.extend_from_slice(&u32::MAX.to_be_bytes());
+        image.extend_from_slice(b"tEXt");
+        image.extend_from_slice(&text(b"parameters", b"after-resync"));
+        image.extend_from_slice(&chunk(b"IDAT", &[1, 2, 3], true));
+        image.extend_from_slice(&text(b"workflow", b"late record"));
+        image.extend_from_slice(&chunk(b"IEND", &[], true));
+
+        let result = scan(&image, false);
+        let bodies: Vec<&str> = result.records.iter().map(|r| r.body.as_ref()).collect();
+        assert!(bodies.contains(&"late record"), "{bodies:?}");
+    }
+
+    /// T-11(b)（REQ-EXT-03(b) / U-4）: 接続証明の無い step 4 のレコードは
+    /// `Source::PngUnproven` となり、通常レコードとして扱われない。
+    #[test]
+    fn t11b_step4_records_are_quarantined_as_unproven() {
+        // IEND を持たない（接続を証明できない）PNG。Stage C step 4 だけが回収できる。
+        let mut image = SIGNATURE.to_vec();
+        image.extend_from_slice(&chunk(b"IHDR", &[0; 13], true));
+        image.extend_from_slice(&chunk(b"IDAT", &[1, 2, 3], true));
+        image.extend_from_slice(&text(b"parameters", b"unproven body"));
+
+        let result = scan(&image, false);
+        assert_eq!(result.stats.stage_c_step, Some(4), "fixture must exercise step 4");
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].source, Source::PngUnproven);
+        assert_eq!(result.records[0].body, "unproven body");
+    }
+
+    /// 接続が証明できた（IEND 到達）レコードは通常の出所のまま残る。
+    #[test]
+    fn connected_records_are_not_quarantined() {
+        let image = png(&[chunk(b"IDAT", &[1, 2, 3], true), text(b"workflow", b"proven")]);
+        let result = scan(&image, false);
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].source, Source::PngText);
     }
 
     #[test]

@@ -3,10 +3,11 @@
 
 use std::borrow::Cow;
 
-use serde_json::Value;
 
 use crate::record::{RecordView, Source};
 
+/// REQ-EXT-12: XMP パケットのハード上限。資源保護のため維持する。上限超過は 0 件
+/// （切り捨てて部分的に読むと構造検証ができず fail-open になるため）。
 pub const XMP_PACKET_LIMIT: usize = 16 * 1024 * 1024;
 
 const NS_DC: &str = "http://purl.org/dc/elements/1.1/";
@@ -139,6 +140,10 @@ struct FieldCandidates<'a> {
     element: Option<Candidate<'a>>,
     attribute: Option<Candidate<'a>>,
     resource: Option<Candidate<'a>>,
+    // REQ-EXT-04(a): 各候補が「主対象」（rdf:about="" の rdf:Description 由来）か。
+    element_main: Option<bool>,
+    attribute_main: Option<bool>,
+    resource_main: Option<bool>,
 }
 
 #[derive(Default)]
@@ -222,25 +227,77 @@ pub fn parse_owned(bytes: Vec<u8>, source: Source) -> Vec<RecordView<'static>> {
         .collect()
 }
 
+fn empty_packet<'a>() -> ParsedPacket<'a> {
+    ParsedPacket {
+        records: Vec::new(),
+        has_extended_xmp: None,
+    }
+}
+
 pub fn parse_packet<'a>(bytes: &'a [u8], source: Source) -> ParsedPacket<'a> {
     if bytes.len() > XMP_PACKET_LIMIT {
+        return empty_packet();
+    }
+    // REQ-EXT-15: UTF-32（BOM は UTF-16LE と共通の FF FE 00 00 で始まる）は対象外。
+    if bytes.starts_with(&[0xff, 0xfe, 0x00, 0x00]) || bytes.starts_with(&[0x00, 0x00, 0xfe, 0xff])
+    {
+        return empty_packet();
+    }
+    if let Some((little_endian, body)) = utf16_bom(bytes) {
+        // 借用できないため、デコードした所有文字列から値をすべて所有化して返す。
+        let Some(xml) = decode_utf16(body, little_endian) else {
+            return empty_packet();
+        };
+        let packet = build_packet(&xml, source, true);
         return ParsedPacket {
-            records: Vec::new(),
-            has_extended_xmp: None,
+            records: packet
+                .records
+                .into_iter()
+                .map(|record| RecordView {
+                    source: record.source,
+                    label: Cow::Owned(record.label.into_owned()),
+                    body: Cow::Owned(record.body.into_owned()),
+                    keyword: record.keyword.map(|keyword| Cow::Owned(keyword.into_owned())),
+                    detail: record.detail.map(|detail| Cow::Owned(detail.into_owned())),
+                })
+                .collect(),
+            has_extended_xmp: packet.has_extended_xmp,
         };
     }
     let Ok(xml) = std::str::from_utf8(bytes) else {
-        return ParsedPacket {
-            records: Vec::new(),
-            has_extended_xmp: None,
-        };
+        return empty_packet();
     };
-    let Some(events) = tokenize(xml) else {
-        return ParsedPacket {
-            records: Vec::new(),
-            has_extended_xmp: None,
-        };
-    };
+    build_packet(xml, source, false)
+}
+
+fn utf16_bom(bytes: &[u8]) -> Option<(bool, &[u8])> {
+    match bytes.get(..2)? {
+        [0xff, 0xfe] => Some((true, bytes.get(2..)?)),
+        [0xfe, 0xff] => Some((false, bytes.get(2..)?)),
+        _ => None,
+    }
+}
+
+fn decode_utf16(bytes: &[u8], little_endian: bool) -> Option<String> {
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            if little_endian {
+                u16::from_le_bytes([pair[0], pair[1]])
+            } else {
+                u16::from_be_bytes([pair[0], pair[1]])
+            }
+        })
+        .collect();
+    String::from_utf16(&units).ok()
+}
+
+/// `own` が true のとき、値は入力文字列からコピーして所有化する（UTF-16 経路用）。
+fn build_packet<'a>(xml: &'a str, source: Source, own: bool) -> ParsedPacket<'a> {
+    let events = tokenize(xml);
     let values = collect_values(&events);
     let selected: Vec<_> = Field::ALL
         .into_iter()
@@ -255,8 +312,10 @@ pub fn parse_packet<'a>(bytes: &'a [u8], source: Source) -> ParsedPacket<'a> {
         })
         .collect();
 
+    // REQ-EXT-07: 抽出層は本文を合成・置換しない。Draw Things の判定は sorter 側の
+    // 値検証（REQ-CLS-07）へ移し、ここでは生の JSON 本文をそのままレコード化する。
+    // dc:description を抑制する副作用も廃止する。
     let mut has_extended_xmp = None;
-    let mut draw_things_body = None;
     for (field, candidate) in &selected {
         if candidate.value.is_empty() {
             continue;
@@ -264,30 +323,15 @@ pub fn parse_packet<'a>(bytes: &'a [u8], source: Source) -> ParsedPacket<'a> {
         if matches!(field, Field::HasExtendedXmp) {
             has_extended_xmp = Some(candidate.value.to_string());
         }
-        if matches!(field, Field::UserComment) {
-            draw_things_body = draw_things_json(candidate.value.as_ref());
-        }
     }
 
-    let suppress_description = draw_things_body.is_some();
     let mut records_with_position = Vec::new();
     for (field, candidate) in selected {
         if matches!(field, Field::HasExtendedXmp) || candidate.value.is_empty() {
             continue;
         }
-        if matches!(field, Field::Description) && suppress_description {
-            continue;
-        }
-        let label = if matches!(field, Field::UserComment) && suppress_description {
-            "Draw Things (XMP)"
-        } else {
-            field.label()
-        };
-        let body = if matches!(field, Field::UserComment) {
-            draw_things_body
-                .clone()
-                .map(Cow::Owned)
-                .unwrap_or_else(|| candidate.value.clone())
+        let body = if own {
+            Cow::Owned(candidate.value.to_string())
         } else {
             candidate.value.clone()
         };
@@ -295,7 +339,7 @@ pub fn parse_packet<'a>(bytes: &'a [u8], source: Source) -> ParsedPacket<'a> {
             candidate.offset,
             RecordView {
                 source,
-                label: Cow::Borrowed(label),
+                label: Cow::Borrowed(field.label()),
                 body,
                 keyword: Some(Cow::Borrowed(field.local())),
                 detail: None,
@@ -313,86 +357,71 @@ pub fn parse_packet<'a>(bytes: &'a [u8], source: Source) -> ParsedPacket<'a> {
     }
 }
 
-fn draw_things_json(text: &str) -> Option<String> {
-    if !text.trim_start().starts_with('{') {
-        return None;
-    }
-    let value: Value = serde_json::from_str(text).ok()?;
-    if !value.as_object()?.contains_key("c") {
-        return None;
-    }
-    let pretty = serde_json::to_string_pretty(&value).ok()?;
-    let mut output = String::new();
-    for (key, label) in [
-        ("c", "Prompt"),
-        ("uc", "Negative prompt"),
-        ("model", "Model"),
-        ("lora", "LoRA"),
-        ("sampler", "Sampler"),
-        ("scale", "CFG scale"),
-        ("seed", "Seed"),
-        ("seed_mode", "Seed mode"),
-        ("shift", "Shift"),
-        ("steps", "Steps"),
-        ("guidance", "Guidance"),
-    ] {
-        if let Some(item) = value.get(key) {
-            if !output.is_empty() {
-                output.push('\n');
-            }
-            output.push_str(label);
-            output.push_str(": ");
-            output.push_str(&json_value_text(item));
-        }
-    }
-    output.push_str("\nJSON:\n");
-    output.push_str(&pretty);
-    Some(output)
-}
-
-fn json_value_text(value: &Value) -> String {
-    value
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| value.to_string())
-}
-
 fn collect_values<'a>(events: &[Event<'a>]) -> XmpValues<'a> {
     let mut values = XmpValues::default();
     let mut element_covered_until: [Option<usize>; FIELD_COUNT] = [None; FIELD_COUNT];
+    // REQ-EXT-04(a): rdf:Description の入れ子を追い、その配下のフィールドが
+    // 「主対象」（rdf:about=""）由来かを判定する。
+    let mut depth = 0usize;
+    let mut descriptions: Vec<(usize, bool)> = Vec::new();
     for (index, event) in events.iter().enumerate() {
+        match event {
+            Event::Start { name, attributes, empty } => {
+                if !*empty {
+                    depth += 1;
+                }
+                if *name
+                    == (ExpandedName {
+                        namespace: Some(NS_RDF),
+                        local: "Description",
+                    })
+                {
+                    let is_main = attributes.iter().any(|attribute| {
+                        attribute.name
+                            == (ExpandedName {
+                                namespace: Some(NS_RDF),
+                                local: "about",
+                            })
+                            && attribute.value.trim().is_empty()
+                    });
+                    descriptions.push((depth, is_main));
+                    for attribute in attributes {
+                        let Some(field) = Field::ALL
+                            .into_iter()
+                            .find(|field| field.matches(attribute.name))
+                        else {
+                            continue;
+                        };
+                        store_candidate(
+                            &mut values.fields[field.index()].attribute,
+                            &mut values.fields[field.index()].attribute_main,
+                            Candidate {
+                                value: decode_entities(attribute.value),
+                                offset: index,
+                            },
+                            is_main,
+                        );
+                    }
+                }
+            }
+            Event::End => {
+                while descriptions.last().is_some_and(|(at, _)| *at >= depth) {
+                    descriptions.pop();
+                }
+                depth = depth.saturating_sub(1);
+            }
+            Event::Text { .. } => {}
+        }
+
         let Event::Start {
             name,
             attributes,
             empty,
-            ..
         } = event
         else {
             continue;
         };
-
-        if *name
-            == (ExpandedName {
-                namespace: Some(NS_RDF),
-                local: "Description",
-            })
-        {
-            for attribute in attributes {
-                let Some(field) = Field::ALL
-                    .into_iter()
-                    .find(|field| field.matches(attribute.name))
-                else {
-                    continue;
-                };
-                store_first(
-                    &mut values.fields[field.index()].attribute,
-                    Candidate {
-                        value: decode_entities(attribute.value),
-                        offset: index,
-                    },
-                );
-            }
-        }
+        let in_main_subject = descriptions.last().is_some_and(|(_, is_main)| *is_main);
 
         let Some(field) = Field::ALL.into_iter().find(|field| field.matches(*name)) else {
             continue;
@@ -404,26 +433,34 @@ fn collect_values<'a>(events: &[Event<'a>]) -> XmpValues<'a> {
                     local: "resource",
                 })
         }) {
-            store_first(
+            store_candidate(
                 &mut values.fields[field.index()].resource,
+                &mut values.fields[field.index()].resource_main,
                 Candidate {
                     value: decode_entities(resource.value),
                     offset: index,
                 },
+                in_main_subject,
             );
         }
         let field_index = field.index();
         let not_covered = element_covered_until[field_index].map_or(true, |end| index > end);
-        if !*empty && values.fields[field_index].element.is_none() && not_covered {
+        // REQ-EXT-04(a): 主対象由来の候補は、既に非主対象の値が入っていても拾い直す
+        // （同じ優先度の中で最初の候補が勝つ、という規則は store_candidate が守る）。
+        let need_element = values.fields[field_index].element.is_none()
+            || (in_main_subject && values.fields[field_index].element_main == Some(false));
+        if !*empty && need_element && not_covered {
             let (value, end_index) = extract_element(events, index);
             element_covered_until[field_index] = Some(end_index);
             if let Some(value) = value {
-                store_first(
+                store_candidate(
                     &mut values.fields[field_index].element,
+                    &mut values.fields[field_index].element_main,
                     Candidate {
                         value,
                         offset: index,
                     },
+                    in_main_subject,
                 );
             }
         }
@@ -431,9 +468,27 @@ fn collect_values<'a>(events: &[Event<'a>]) -> XmpValues<'a> {
     values
 }
 
-fn store_first<'a>(slot: &mut Option<Candidate<'a>>, candidate: Candidate<'a>) {
-    if slot.is_none() && !candidate.value.is_empty() {
-        *slot = Some(candidate);
+/// REQ-EXT-04(a): 主対象（rdf:about=""）由来の候補を優先し、無い場合のみ従来どおり
+/// 先勝ちにする。同じ優先度の中では最初の候補を採る。
+fn store_candidate<'a>(
+    slot: &mut Option<Candidate<'a>>,
+    main_slot: &mut Option<bool>,
+    candidate: Candidate<'a>,
+    is_main: bool,
+) {
+    if candidate.value.is_empty() {
+        return;
+    }
+    match *main_slot {
+        None => {
+            *slot = Some(candidate);
+            *main_slot = Some(is_main);
+        }
+        Some(false) if is_main => {
+            *slot = Some(candidate);
+            *main_slot = Some(true);
+        }
+        _ => {}
     }
 }
 
@@ -590,7 +645,9 @@ fn decode_numeric_entity(entity: &str) -> Option<char> {
     char::from_u32(number)
 }
 
-fn tokenize<'a>(xml: &'a str) -> Option<Vec<Event<'a>>> {
+/// REQ-EXT-11: 局所破損があっても、破損箇所より前のイベントは返す（all-or-nothing をやめる）。
+/// 再同期できない範囲（終端の無いコメント／CDATA／タグ等）はそこで打ち切る。
+fn tokenize<'a>(xml: &'a str) -> Vec<Event<'a>> {
     let bytes = xml.as_bytes();
     let mut events = Vec::new();
     let mut namespaces = vec![("xml", NS_XML)];
@@ -601,43 +658,57 @@ fn tokenize<'a>(xml: &'a str) -> Option<Vec<Event<'a>>> {
         if bytes[cursor] != b'<' {
             let relative_end = bytes[cursor..].iter().position(|&byte| byte == b'<');
             let end = relative_end.map_or(bytes.len(), |relative| cursor + relative);
-            events.push(Event::Text {
-                value: std::str::from_utf8(&bytes[cursor..end]).ok()?,
-                cdata: false,
-            });
+            let Ok(value) = std::str::from_utf8(&bytes[cursor..end]) else {
+                break;
+            };
+            events.push(Event::Text { value, cdata: false });
             cursor = end;
             continue;
         }
         if bytes[cursor..].starts_with(b"<!--") {
-            let end = find_bytes(bytes, cursor + 4, b"-->")?;
+            let Some(end) = find_bytes(bytes, cursor + 4, b"-->") else {
+                break;
+            };
             cursor = end + 3;
             continue;
         }
         if bytes[cursor..].starts_with(b"<![CDATA[") {
             let content_start = cursor + 9;
-            let end = find_bytes(bytes, content_start, b"]]>")?;
-            events.push(Event::Text {
-                value: std::str::from_utf8(&bytes[content_start..end]).ok()?,
-                cdata: true,
-            });
+            let Some(end) = find_bytes(bytes, content_start, b"]]>") else {
+                break;
+            };
+            let Ok(value) = std::str::from_utf8(&bytes[content_start..end]) else {
+                break;
+            };
+            events.push(Event::Text { value, cdata: true });
             cursor = end + 3;
             continue;
         }
         if bytes[cursor..].starts_with(b"<?") {
-            let end = find_bytes(bytes, cursor + 2, b"?>")?;
+            let Some(end) = find_bytes(bytes, cursor + 2, b"?>") else {
+                break;
+            };
             cursor = end + 2;
             continue;
         }
         if bytes[cursor..].starts_with(b"<!") {
-            let end = bytes[cursor..].iter().position(|&byte| byte == b'>')? + cursor;
-            cursor = end + 1;
+            let Some(relative) = bytes[cursor..].iter().position(|&byte| byte == b'>') else {
+                break;
+            };
+            cursor += relative + 1;
             continue;
         }
 
-        let end = find_tag_end(bytes, cursor + 1)?;
-        let inside = std::str::from_utf8(&bytes[cursor + 1..end]).ok()?;
+        let Some(end) = find_tag_end(bytes, cursor + 1) else {
+            break;
+        };
+        let Ok(inside) = std::str::from_utf8(&bytes[cursor + 1..end]) else {
+            break;
+        };
         if let Some(close) = inside.strip_prefix('/') {
-            let raw_name = first_name(close.trim_start())?;
+            let Some(raw_name) = first_name(close.trim_start()) else {
+                break;
+            };
             events.push(Event::End);
             if let Some(frame_index) = frames.iter().rposition(|frame| frame.raw_name == raw_name) {
                 let frame = frames.remove(frame_index);
@@ -647,11 +718,16 @@ fn tokenize<'a>(xml: &'a str) -> Option<Vec<Event<'a>>> {
         } else {
             let empty = inside.trim_end().ends_with('/');
             let content = if empty {
-                inside.trim_end().strip_suffix('/')?
+                let Some(stripped) = inside.trim_end().strip_suffix('/') else {
+                    break;
+                };
+                stripped
             } else {
                 inside
             };
-            let (raw_name, raw_attributes) = parse_start_tag(content)?;
+            let Some((raw_name, raw_attributes)) = parse_start_tag(content) else {
+                break;
+            };
             let old_len = namespaces.len();
             for attribute in &raw_attributes {
                 if let Some(prefix) = attribute.name.strip_prefix("xmlns:") {
@@ -684,7 +760,7 @@ fn tokenize<'a>(xml: &'a str) -> Option<Vec<Event<'a>>> {
         }
         cursor = end + 1;
     }
-    Some(events)
+    events
 }
 
 fn find_bytes(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
@@ -918,43 +994,36 @@ mod tests {
         assert_eq!(parsed.records[0].body, "A&B < A 😀 <raw>&copy;");
     }
 
+    /// T-17（REQ-EXT-07）: Draw Things 風 JSON でも本文を合成せず、dc:description も
+    /// 抑制しない。判定は sorter 側（REQ-CLS-07）に移した。
     #[test]
-    fn xmp_draw_things_json_is_pretty_and_suppresses_description() {
+    fn t17_draw_things_json_is_not_synthesized_nor_suppresses_description() {
         let packet = rdf(
             "<rdf:Description xmlns:d='http://purl.org/dc/elements/1.1/' xmlns:e='http://ns.adobe.com/exif/1.0/'><d:description>duplicate prompt</d:description><e:UserComment>{&quot;c&quot;:&quot;cat&quot;,&quot;uc&quot;:&quot;bad&quot;}</e:UserComment></rdf:Description>",
         );
         let parsed = parse_packet(packet.as_bytes(), Source::PngXmp);
-        assert_eq!(parsed.records.len(), 1);
-        assert_eq!(parsed.records[0].label, "Draw Things (XMP)");
-        assert!(parsed.records[0]
-            .body
-            .starts_with("Prompt: cat\nNegative prompt: bad\nJSON:\n"));
-        assert!(parsed.records[0]
-            .body
-            .ends_with("{\n  \"c\": \"cat\",\n  \"uc\": \"bad\"\n}"));
-    }
-
-    #[test]
-    fn draw_things_json_accepts_leading_whitespace_and_suppresses_description() {
-        let packet = rdf(
-            "<rdf:Description xmlns:d='http://purl.org/dc/elements/1.1/' xmlns:e='http://ns.adobe.com/exif/1.0/'><d:description>duplicate prompt</d:description><e:UserComment> \n\t{&quot;c&quot;:&quot;cat&quot;}</e:UserComment></rdf:Description>",
-        );
-        let parsed = parse_packet(packet.as_bytes(), Source::PngXmp);
-
-        assert_eq!(parsed.records.len(), 1);
-        assert_eq!(parsed.records[0].label, "Draw Things (XMP)");
-        assert!(parsed.records[0].body.starts_with("Prompt: cat\nJSON:\n"));
-    }
-
-    #[test]
-    fn invalid_draw_things_json_keeps_description_and_user_comment() {
-        let packet = rdf(
-            "<rdf:Description xmlns:d='http://purl.org/dc/elements/1.1/' xmlns:e='http://ns.adobe.com/exif/1.0/'><d:description>ordinary description</d:description><e:UserComment>{not json}</e:UserComment></rdf:Description>",
-        );
-        let parsed = parse_packet(packet.as_bytes(), Source::JpegXmp);
         assert_eq!(parsed.records.len(), 2);
         assert_eq!(parsed.records[0].label, "XMP Description");
+        assert_eq!(parsed.records[0].body, "duplicate prompt");
         assert_eq!(parsed.records[1].label, "XMP UserComment");
+        assert_eq!(parsed.records[1].body, "{\"c\":\"cat\",\"uc\":\"bad\"}");
+        assert_eq!(
+            parsed.records[1].keyword.as_deref(),
+            Some("UserComment"),
+            "sorter 側の値検証に生 JSON を渡す"
+        );
+    }
+
+    /// `"c"` 単独（Draw Things の固有キー集合を満たさない）でも本文は素通しする。
+    #[test]
+    fn draw_things_c_only_json_is_passed_through_as_is() {
+        let packet = rdf(
+            "<rdf:Description xmlns:e='http://ns.adobe.com/exif/1.0/'><e:UserComment> \n\t{&quot;c&quot;:&quot;cat&quot;}</e:UserComment></rdf:Description>",
+        );
+        let parsed = parse_packet(packet.as_bytes(), Source::PngXmp);
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.records[0].label, "XMP UserComment");
+        assert_eq!(parsed.records[0].body, " \n\t{\"c\":\"cat\"}");
     }
 
     #[test]
@@ -970,6 +1039,85 @@ mod tests {
         assert_eq!(parsed.records.len(), 1);
         assert_eq!(parsed.records[0].label, "XMP AIPromptInformation");
         assert_eq!(parsed.records[0].body, "draw a tree");
+    }
+
+    /// T-37（REQ-EXT-04(a)）: 複数の rdf:Description がある場合、主対象
+    /// （rdf:about=""）のフィールドを優先する。主対象に無いフィールドは従来どおり先勝ち。
+    #[test]
+    fn t37_main_subject_description_is_preferred_per_field() {
+        let packet = rdf(
+            "<rdf:Description rdf:about='other' xmlns:d='http://purl.org/dc/elements/1.1/' xmlns:x='http://ns.adobe.com/xap/1.0/'><d:description>secondary</d:description><x:CreatorTool>OtherTool</x:CreatorTool></rdf:Description><rdf:Description rdf:about='' xmlns:d='http://purl.org/dc/elements/1.1/'><d:description>main subject</d:description></rdf:Description>",
+        );
+        let parsed = parse_packet(packet.as_bytes(), Source::JpegXmp);
+        let description = parsed
+            .records
+            .iter()
+            .find(|record| record.keyword.as_deref() == Some("description"))
+            .expect("description record");
+        assert_eq!(description.body, "main subject");
+        // 主対象に無いフィールドは先勝ちのまま残る。
+        let creator = parsed
+            .records
+            .iter()
+            .find(|record| record.keyword.as_deref() == Some("CreatorTool"))
+            .expect("CreatorTool record");
+        assert_eq!(creator.body, "OtherTool");
+    }
+
+    /// T-30（REQ-EXT-12）: 16MB を超える XMP パケットは 0 件（資源保護のための仕様）。
+    #[test]
+    fn t30_xmp_packet_over_the_16mb_limit_yields_no_records() {
+        let mut packet = vec![b' '; super::XMP_PACKET_LIMIT + 1];
+        packet[..5].copy_from_slice(b"<?xml");
+        assert!(parse_packet(&packet, Source::PngXmp).records.is_empty());
+    }
+
+    /// T-29（REQ-EXT-11）: 局所破損（終端の無いコメント）があっても、
+    /// 破損箇所より前の正常なフィールドはレコード化する。
+    #[test]
+    fn t29_local_corruption_keeps_fields_before_the_damage() {
+        let packet = rdf(
+            "<rdf:Description xmlns:d='http://purl.org/dc/elements/1.1/'><d:description>before damage</d:description></rdf:Description><!-- unterminated comment",
+        );
+        let parsed = parse_packet(packet.as_bytes(), Source::JpegXmp);
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.records[0].body, "before damage");
+    }
+
+    /// T-33（REQ-EXT-15）: UTF-16（BOM 付き BE／LE）の XMP パケットも読める。
+    /// UTF-32 は対象外（0 件）。
+    #[test]
+    fn t33_utf16_packets_are_read_and_utf32_is_not() {
+        let packet = rdf(
+            "<rdf:Description xmlns:d='http://purl.org/dc/elements/1.1/'><d:description>utf16 body</d:description></rdf:Description>",
+        );
+        for little_endian in [true, false] {
+            let mut bytes = if little_endian {
+                vec![0xff, 0xfe]
+            } else {
+                vec![0xfe, 0xff]
+            };
+            for unit in packet.encode_utf16() {
+                let encoded = if little_endian {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                };
+                bytes.extend_from_slice(&encoded);
+            }
+            let parsed = parse_packet(&bytes, Source::PngXmp);
+            assert_eq!(parsed.records.len(), 1, "le={little_endian}");
+            assert_eq!(parsed.records[0].body, "utf16 body");
+        }
+        // UTF-32 LE/BE は対象外。
+        let utf32_le: Vec<u8> = [0xff, 0xfe, 0x00, 0x00]
+            .into_iter()
+            .chain(packet.encode_utf16().flat_map(|unit| {
+                let bytes = (unit as u32).to_le_bytes();
+                bytes.into_iter()
+            }))
+            .collect();
+        assert!(parse_packet(&utf32_le, Source::PngXmp).records.is_empty());
     }
 
     #[test]

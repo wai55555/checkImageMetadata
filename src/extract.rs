@@ -96,22 +96,104 @@ fn format_of(bytes: &[u8]) -> Option<Format> {
     }
 }
 
-fn has_normal_metadata(records: &[RecordView<'_>]) -> bool {
-    records.iter().any(|record| {
-        matches!(
-            record.source,
-            record::Source::PngText
-                | record::Source::PngExif
-                | record::Source::PngXmp
-                | record::Source::JpegExif
-                | record::Source::JpegXmp
-                | record::Source::JpegComment
-                | record::Source::JpegIptc
-                | record::Source::WebpExif
-                | record::Source::WebpXmp
-                | record::Source::TiffXmp
-        )
-    })
+/// REQ-EXT-01: Stealth Auto ゲート。「生成内容／生成パラメータを担うレコード」
+/// （実質レコード）が 1 件でもあるときだけ検査を閉じる。汎用レコードだけでは閉じない。
+/// 値ではなくレコード種別で決める（抽出層の検査要否であって生成元の判定ではない）。
+fn is_substantive_record(record: &RecordView<'_>) -> bool {
+    // Trailing は汎用側（ゲートを閉じない）。
+    if matches!(record.source, record::Source::Trailing) {
+        return false;
+    }
+    match record.source {
+        record::Source::PngText => !matches!(
+            record.keyword.as_deref(),
+            Some("Software" | "Title" | "Source")
+        ),
+        record::Source::PngExif
+        | record::Source::JpegExif
+        | record::Source::WebpExif => !matches!(
+            record.keyword.as_deref(),
+            Some("Software" | "Make" | "Model" | "Artist" | "XPComment")
+        ),
+        record::Source::JpegComment => true,
+        record::Source::PngXmp
+        | record::Source::JpegXmp
+        | record::Source::WebpXmp
+        | record::Source::TiffXmp => !matches!(
+            record.keyword.as_deref(),
+            Some("CreatorTool" | "title")
+        ),
+        record::Source::JpegIptc => !matches!(record.keyword.as_deref(), Some("Caption/Abstract")),
+        // 表に無い種別は「内容を担う側」に倒す（仕様書 §5 REQ-EXT-01 の注記）。
+        _ => true,
+    }
+}
+
+fn has_substantive_record(records: &[RecordView<'_>]) -> bool {
+    records.iter().any(is_substantive_record)
+}
+
+#[cfg(test)]
+mod stealth_gate_tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    fn record(
+        source: record::Source,
+        body: &'static str,
+        keyword: Option<&'static str>,
+    ) -> RecordView<'static> {
+        RecordView {
+            source,
+            label: Cow::Borrowed("label"),
+            body: Cow::Borrowed(body),
+            keyword: keyword.map(Cow::Borrowed),
+            detail: None,
+        }
+    }
+
+    /// T-40: 実質レコード（閉じる側）の代表。
+    #[test]
+    fn t40_substantive_records_close_the_stealth_gate() {
+        for record in [
+            record(record::Source::PngText, "Steps: 20", Some("parameters")),
+            record(record::Source::PngText, "a cat", Some("Description")),
+            record(record::Source::JpegExif, "a cat", Some("UserComment")),
+            record(record::Source::PngExif, "a cat", Some("ImageDescription")),
+            record(record::Source::JpegComment, "a cat", None),
+            record(record::Source::PngXmp, "a cat", Some("description")),
+            record(record::Source::PngXmp, "a cat", Some("AIPromptInformation")),
+            record(record::Source::PngXmp, "x", Some("DigitalSourceType")),
+        ] {
+            assert!(
+                has_substantive_record(&[record.clone()]),
+                "{:?}/{:?} must close the gate",
+                record.source,
+                record.keyword
+            );
+        }
+    }
+
+    /// T-40: 汎用レコード（閉じない側）の代表。
+    #[test]
+    fn t40_generic_records_keep_the_stealth_gate_open() {
+        for record in [
+            record(record::Source::PngText, "Celsys Studio Tool", Some("Software")),
+            record(record::Source::PngText, "a title", Some("Title")),
+            record(record::Source::PngExif, "Adobe", Some("Software")),
+            record(record::Source::JpegXmp, "Midjourney", Some("CreatorTool")),
+            record(record::Source::PngXmp, "a title", Some("title")),
+            record(record::Source::JpegIptc, "caption", Some("Caption/Abstract")),
+            record(record::Source::Trailing, "novelai", None),
+        ] {
+            assert!(
+                !has_substantive_record(&[record.clone()]),
+                "{:?}/{:?} must keep the gate open",
+                record.source,
+                record.keyword
+            );
+        }
+    }
 }
 
 fn stealth_record(result: Option<(String, String, String)>) -> Option<RecordView<'static>> {
@@ -154,7 +236,7 @@ pub fn scan_file(
             outcome.comfy_tail_notice = result.stats.comfy_tail_notice;
             let stealth = match options.stealth {
                 StealthPolicy::Never => None,
-                StealthPolicy::Auto if has_normal_metadata(&result.records) => None,
+                StealthPolicy::Auto if has_substantive_record(&result.records) => None,
                 StealthPolicy::Auto | StealthPolicy::Always => check_stealth_png(&mmap),
             };
             for record in &result.records {
@@ -188,12 +270,47 @@ pub fn scan_file(
 }
 
 /// CLI 用：見出し・案内文言・レコード出力を mmap と同じフレーム内で行う。
+/// 診断文（レコードでも見出しでもない案内文言）は従来どおり `out` へ出す。
 pub fn extract_to_writer(
     path: &Path,
     options: &ScanOptions,
     out: &mut dyn Write,
 ) -> Result<ScanOutcome, ScanError> {
-    extract_universal_metadata(path, options, out)
+    // REQ-DSP-02: 呼び出し側が診断文の行き先を分けられるよう、同じ writer を共有する。
+    let shared = std::cell::RefCell::new(out);
+    let mut primary = SharedWriter {
+        inner: &shared,
+    };
+    let mut diagnostics = SharedWriter {
+        inner: &shared,
+    };
+    extract_universal_metadata(path, options, &mut primary, &mut diagnostics)
+}
+
+/// REQ-DSP-02: レコードと見出しは `out`、診断文は `diagnostics` へ出す。
+/// `out` の内容（見出し行とレコード出力）は従来どおりで、診断文だけが分離される。
+pub fn extract_to_writer_with_diagnostics(
+    path: &Path,
+    options: &ScanOptions,
+    out: &mut dyn Write,
+    diagnostics: &mut dyn Write,
+) -> Result<ScanOutcome, ScanError> {
+    extract_universal_metadata(path, options, out, diagnostics)
+}
+
+/// 同じ writer を 2 つの `&mut dyn Write` から使うための小さな共有ラッパー。
+struct SharedWriter<'a, 'b: 'a> {
+    inner: &'a std::cell::RefCell<&'b mut dyn Write>,
+}
+
+impl Write for SharedWriter<'_, '_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.inner.borrow_mut().write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.borrow_mut().flush()
+    }
 }
 
 
@@ -203,20 +320,22 @@ fn extract_png_metadata<W: Write + ?Sized>(
     strict: bool,
     stealth_policy: StealthPolicy,
     writer: &mut W,
+    diagnostics: &mut dyn Write,
 ) -> Result<(usize, bool), ScanError> {
     use crate::output::TextSink;
     let result = png::scan(mmap, strict);
     let comfy_tail_notice = result.stats.comfy_tail_notice;
     writeln!(writer, "=== PNG File: {} ===", path)?;
     if comfy_tail_notice {
+        // REQ-DSP-02: 案内文言はレコードでも見出しでもないため stderr 側へ出す。
         writeln!(
-            writer,
+            diagnostics,
             "(Large file or ComfyUI detected. Scanning tail for metadata...)"
         )?;
     }
     let stealth_result = match stealth_policy {
         StealthPolicy::Never => None,
-        StealthPolicy::Auto if has_normal_metadata(&result.records) => None,
+        StealthPolicy::Auto if has_substantive_record(&result.records) => None,
         StealthPolicy::Auto | StealthPolicy::Always => check_stealth_png(mmap),
     };
     let mut sink = TextSink::default();
@@ -816,8 +935,27 @@ fn webp_records(mmap: &[u8]) -> Vec<record::RecordView<'_>> {
     if mmap.get(..4) != Some(b"RIFF") || mmap.get(8..12) != Some(b"WEBP") {
         return Vec::new();
     }
+    // REQ-EXT-08: RIFF サイズを読み、そのペイロードの範囲内だけを歩く。
+    // 範囲外（末尾に付いたデータ等）に EXIF／XMP 形状のバイト列があっても拾わない。
+    let Some(riff_size_bytes) = mmap.get(4..8) else {
+        return Vec::new();
+    };
+    let Ok(riff_size_bytes) = <[u8; 4]>::try_from(riff_size_bytes) else {
+        return Vec::new();
+    };
+    let riff_size = u32::from_le_bytes(riff_size_bytes) as usize;
+    // "RIFF" + size(4) + size バイト = 論理的な終端。
+    // サイズが 0 またはファイル長を超える（壊れた／切り詰められた）場合は
+    // 「不明」として従来どおり実ファイル長まで歩く。既存の許容
+    // （サイズ 0 でもチャンクを読む）を退行させないための判断で、
+    // 宣言されたサイズが妥当なときに範囲外を読まないことが本要件の主眼。
+    let declared_end = 8usize.checked_add(riff_size);
+    let riff_end = match declared_end {
+        Some(end) if riff_size != 0 && end <= mmap.len() => end,
+        _ => mmap.len(),
+    };
     let mut cursor = 12usize;
-    let len = mmap.len();
+    let len = riff_end;
     let mut records = Vec::new();
     while let Some(header_end) = cursor.checked_add(8) {
         if header_end > len {
@@ -845,7 +983,12 @@ fn webp_records(mmap: &[u8]) -> Vec<record::RecordView<'_>> {
         }
 
         if chunk_type == b"EXIF" {
-            let exif_data = &mmap[data_start..data_end];
+            let mut exif_data = &mmap[data_start..data_end];
+            // REQ-EXT-16: WebP の EXIF チャンクは先頭に `Exif\0\0` が付くことがある。
+            // TIFF パーサはそのままだと 0 件になるため読み飛ばす（無い場合は従来どおり）。
+            if let Some(rest) = exif_data.strip_prefix(b"Exif\0\0") {
+                exif_data = rest;
+            }
             records.extend(tiff::parse(exif_data, record::Source::WebpExif));
         } else if chunk_type == b"XMP " {
             records.extend(xmp::parse(
@@ -893,6 +1036,7 @@ fn extract_universal_metadata<W: Write + ?Sized>(
     path: &Path,
     options: &ScanOptions,
     writer: &mut W,
+    diagnostics: &mut dyn Write,
 ) -> Result<ScanOutcome, ScanError> {
     let file = File::open(path)?;
     if file.metadata()?.len() == 0 {
@@ -916,6 +1060,7 @@ fn extract_universal_metadata<W: Write + ?Sized>(
                 options.strict,
                 options.stealth,
                 writer,
+                diagnostics,
             )?;
             Ok(ScanOutcome {
                 format: Some(format),
@@ -973,6 +1118,54 @@ mod webp_tests {
         image.extend_from_slice(&(body.len() as u32).to_le_bytes());
         image.extend_from_slice(&body);
         image
+    }
+
+    /// T-38（REQ-EXT-16）: `Exif\0\0` プレフィクス付きの EXIF チャンクから読める。
+    #[test]
+    fn t38_reads_webp_exif_chunk_with_exif_prefix() {
+        let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&0x9286u16.to_le_bytes());
+        tiff.extend_from_slice(&7u16.to_le_bytes());
+        let comment = b"ASCII\0\0\0prefixed";
+        tiff.extend_from_slice(&(comment.len() as u32).to_le_bytes());
+        tiff.extend_from_slice(&26u32.to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend_from_slice(comment);
+        let mut payload = b"Exif\0\0".to_vec();
+        payload.extend_from_slice(&tiff);
+
+        let image = webp(&[webp_chunk(b"EXIF", &payload)]);
+        let records = webp_records(&image);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].body, "prefixed");
+    }
+
+    /// T-18（REQ-EXT-08）: RIFF ペイロードの外側にある EXIF／XMP 形状のバイト列は拾わない。
+    #[test]
+    fn t18_ignores_chunk_like_bytes_after_the_riff_payload() {
+        let packet = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description xmlns:d='http://purl.org/dc/elements/1.1/'><d:description>inside</d:description></rdf:Description></rdf:RDF></x:xmpmeta>";
+        let mut image = webp(&[webp_chunk(b"XMP ", packet)]);
+        // RIFF の外側に、同じ形の XMP チャンクを後置する。
+        image.extend_from_slice(&webp_chunk(b"XMP ", b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description xmlns:d='http://purl.org/dc/elements/1.1/'><d:description>outside</d:description></rdf:Description></rdf:RDF></x:xmpmeta>"));
+        let records = webp_records(&image);
+        let bodies: Vec<&str> = records.iter().map(|record| record.body.as_ref()).collect();
+        assert_eq!(bodies, ["inside"]);
+    }
+
+    /// T-39（REQ-EXT-05(b)）: チャンクサイズ不正で歩行を止めても、
+    /// それまでに得たレコードは捨てずに返す。
+    #[test]
+    fn t39_webp_returns_records_before_an_invalid_chunk_size() {
+        let packet = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description xmlns:d='http://purl.org/dc/elements/1.1/'><d:description>kept</d:description></rdf:Description></rdf:RDF></x:xmpmeta>";
+        let mut image = webp(&[webp_chunk(b"XMP ", packet)]);
+        // 不正なチャンクサイズ（ファイル長を超える）を後置する。
+        image.extend_from_slice(b"EXIF");
+        image.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let records = webp_records(&image);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].body, "kept");
     }
 
     #[test]
